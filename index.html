@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="ca">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MTG Scanner – OCR codi inferior esquerra + preu</title>
+<style>
+  :root{font-family:system-ui,Arial,sans-serif}
+  body{margin:18px}
+  h1{font-size:1.15rem;margin:0 0 10px}
+  .grid{display:grid;grid-template-columns:360px 1fr;gap:16px;align-items:start}
+  video,canvas{width:100%;max-width:100%;background:#111;border-radius:8px}
+  .panel{border:1px solid #e5e5e5;border-radius:10px;padding:12px;background:#fafafa}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .btn{padding:8px 12px;border:1px solid #888;background:white;cursor:pointer;border-radius:8px}
+  .ok{color:#0a7b25}
+  .warn{color:#b35a00}
+  .bad{color:#b00020}
+  .item{border-top:1px dashed #ddd;padding:8px 0}
+  .big{font-size:1.25rem}
+  .pill{display:inline-block;padding:.15rem .45rem;border:1px solid #ddd;border-radius:999px;background:#fff;margin-left:.4rem}
+  #status{min-height:24px}
+  code{background:#f3f3f3;padding:.1rem .25rem;border-radius:4px}
+</style>
+</head>
+<body>
+<h1>Escaneig automàtic del codi (inferior esquerra) + consulta de preus</h1>
+
+<div class="grid">
+  <div>
+    <video id="video" autoplay playsinline muted></video>
+    <div class="panel" style="margin-top:10px">
+      <div class="row">
+        <button id="start" class="btn">Inicia càmera</button>
+        <button id="stop" class="btn">Atura</button>
+        <label>Freq. (s): <input id="interval" type="number" min="0.5" step="0.1" value="1.2" class="pill"></label>
+        <label>Llindar alerta (€): <input id="threshold" type="number" step="0.5" value="15" class="pill"></label>
+        <label><input id="beep" type="checkbox" checked> so si supera llindar</label>
+        <label><input id="strictEs" type="checkbox" checked> preferir cartes en espanyol</label>
+      </div>
+      <div id="status" class="small"></div>
+    </div>
+    <canvas id="work" width="640" height="480" hidden></canvas>
+    <canvas id="roi" hidden></canvas>
+  </div>
+
+  <div>
+    <div class="panel">
+      <div><b>Últim codi:</b> <span id="lastCode">—</span></div>
+      <div style="margin-top:6px"><b>Preu estimat:</b> <span id="lastPrice" class="big">—</span></div>
+      <div id="explain" class="small" style="margin-top:6px;color:#555"></div>
+    </div>
+
+    <div class="panel" style="margin-top:10px">
+      <div><b>Historial</b></div>
+      <div id="list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Tesseract (OCR) -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
+<script>
+const video = document.getElementById('video');
+const work  = document.getElementById('work');
+const wctx  = work.getContext('2d');
+const roiC  = document.getElementById('roi');
+const rctx  = roiC.getContext('2d');
+
+const startBtn = document.getElementById('start');
+const stopBtn  = document.getElementById('stop');
+const statusEl = document.getElementById('status');
+const lastCode = document.getElementById('lastCode');
+const lastPrice= document.getElementById('lastPrice');
+const listEl   = document.getElementById('list');
+const explain  = document.getElementById('explain');
+const intervalIn = document.getElementById('interval');
+const thresholdIn= document.getElementById('threshold');
+const beepChk  = document.getElementById('beep');
+const strictEs = document.getElementById('strictEs');
+
+let stream=null, timer=null, running=false, scanning=false;
+let seen = new Set(); // evita reconsultar el mateix codi seguit
+
+// ROI candidates (x,y,w,h en percentatge del frame)
+const CANDS = [
+  // inferiors esquerres (carta dreta)
+  {x:.03,y:.80,w:.46,h:.15},
+  {x:.05,y:.78,w:.50,h:.16},
+  {x:.02,y:.82,w:.40,h:.14},
+  {x:.06,y:.83,w:.42,h:.14},
+];
+// també el cas girat 180° (top-right equivalent)
+function rotated(c){ return { x:1-(c.x+c.w), y:1-(c.y+c.h), w:c.w, h:c.h }; }
+const ALL_CANDS = [...CANDS, ...CANDS.map(rotated)];
+
+async function startCam(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+    video.srcObject = stream;
+    running = true;
+    schedule();
+    status('Càmera en marxa. Passa cartes davant del visor.');
+  }catch(e){
+    status('No s’ha pogut obrir la càmera: '+e.message, 'bad');
+  }
+}
+function stopCam(){
+  running=false;
+  if(timer){ clearTimeout(timer); timer=null; }
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  status('Aturat.');
+}
+startBtn.onclick = startCam;
+stopBtn.onclick  = stopCam;
+
+function schedule(){
+  if(!running) return;
+  const ms = Math.max(300, Number(intervalIn.value)*1000);
+  timer = setTimeout(tick, ms);
+}
+
+async function tick(){
+  if(!running) return;
+  if(scanning){ schedule(); return; }
+  scanning=true;
+  try{
+    // Captura frame
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if(!vw || !vh){ scanning=false; schedule(); return; }
+    work.width = vw; work.height = vh;
+    wctx.drawImage(video,0,0,vw,vh);
+
+    // prova candidates
+    for(const c of ALL_CANDS){
+      const ok = await tryCandidate(c);
+      if(ok) break; // si ja hem trobat codi vàlid, parem aquesta volta
+    }
+  }catch(e){
+    console.error(e);
+  }finally{
+    scanning=false;
+    schedule();
+  }
+}
+
+async function tryCandidate(c){
+  const {width:vw, height:vh} = work;
+  const sx = Math.max(0, Math.floor(vw*c.x));
+  const sy = Math.max(0, Math.floor(vh*c.y));
+  const sw = Math.floor(vw*c.w);
+  const sh = Math.floor(vh*c.h);
+
+  // retall + preprocess (B/N amb contrast)
+  roiC.width = sw; roiC.height = sh;
+  rctx.drawImage(work, sx, sy, sw, sh, 0, 0, sw, sh);
+  const img = rctx.getImageData(0,0,sw,sh);
+  const d = img.data;
+  for(let i=0;i<d.length;i+=4){
+    // luminància + augment de contrast
+    let y = 0.2126*d[i] + 0.7152*d[i+1] + 0.0722*d[i+2];
+    y = (y-128)*1.6 + 128;
+    y = y<110 ? 0 : y>160 ? 255 : y; // binarització suau a la franja de text
+    d[i]=d[i+1]=d[i+2]=y; d[i+3]=255;
+  }
+  rctx.putImageData(img,0,0);
+
+  // OCR
+  const { data } = await Tesseract.recognize(roiC, 'eng', { tessedit_char_whitelist:'0123456789/ CMURcmur' });
+  const raw = (data.text||'').replace(/\s+/g,' ').trim();
+
+  // patró com 039/302 C
+  const m = raw.match(/(\d{1,3})\s*\/\s*(\d{1,3})\s*([A-Za-z])?/);
+  if(!m) { status('Sense codi…'); return false; }
+
+  const number = String(+m[1]);
+  const total  = String(+m[2]);
+  const rarity = (m[3]||'').toUpperCase();
+
+  const key = number+'|'+rarity;
+  if(seen.has(key)) { status(`Codi detectat ${number}/${total} ${rarity} (ja consultat).`); return true; }
+  seen.add(key);
+
+  lastCode.textContent = `${m[1]}/${m[2]} ${rarity||''}`.trim();
+  explain.textContent = 'Cerca a Scryfall per número (i llengua/raresa si es pot).';
+
+  const price = await lookupPrice({number, rarity, preferEs: strictEs.checked});
+  renderPrice(price);
+  return true;
+}
+
+async function lookupPrice({number, rarity, preferEs}){
+  // construeix query relativament estricta; si no hi ha èxit, relaxa
+  let q = `number:${number}` + (rarity?` rarity:${rarity.toLowerCase()}`:'');
+  if(preferEs) q += ' lang:es';
+
+  let data = await scry(q);
+  if(!data.length && preferEs) {
+    // relaxa a qualsevol idioma
+    data = await scry(`number:${number}` + (rarity?` rarity:${rarity.toLowerCase()}`:''));
+  }
+
+  if(!data.length) return {ok:false, why:'Sense coincidències a Scryfall.'};
+
+  // escull la millor coincidència: amb preu definit i més alt
+  const items = data.map(c=>{
+    const p = c.prices||{};
+    const usd = +(p.usd||p.usd_foil||p.usd_etched||0);
+    const eur = +(p.eur||p.eur_foil||0);
+    const best = eur || usd || 0;
+    return {card:c, usd, eur, best};
+  }).sort((a,b)=>b.best-a.best);
+
+  const best = items[0];
+  return {
+    ok:true,
+    name: best.card.name,
+    set:  best.card.set.toUpperCase(),
+    lang: best.card.lang.toUpperCase(),
+    number: best.card.collector_number,
+    rarity: best.card.rarity,
+    usd: best.usd || null,
+    eur: best.eur || null,
+    link: best.card.scryfall_uri || best.card.uri
+  };
+}
+
+async function scry(q){
+  try{
+    const res = await fetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}`);
+    const json = await res.json();
+    return json.data || [];
+  }catch(e){
+    status('Error Scryfall: '+e.message,'bad');
+    return [];
+  }
+}
+
+function renderPrice(res){
+  if(!res.ok){
+    lastPrice.textContent = '—';
+    explain.textContent = res.why||'—';
+    return;
+  }
+  const eur = res.eur ? res.eur.toFixed(2)+' €' : '—';
+  const usd = res.usd ? '$'+res.usd.toFixed(2) : '—';
+  lastPrice.innerHTML = `${eur} <span class="small">(USD ${usd})</span>`;
+  explain.innerHTML = `${res.name} (${res.set}) · #${res.number} · ${res.lang} · ${res.rarity} · <a href="${res.link}" target="_blank" rel="noopener">Scryfall</a>`;
+
+  const row = document.createElement('div');
+  row.className = 'item';
+  row.innerHTML =
+    `<div><b>${res.name}</b> (${res.set}) · #${res.number} · ${res.lang}</div>
+     <div>Preu: <b>${eur}</b> <span class="small">(USD ${usd})</span></div>`;
+  listEl.prepend(row);
+
+  const thr = Number(thresholdIn.value)||0;
+  if((res.eur||res.usd||0) >= thr){
+    lastPrice.classList.add('ok');
+    alertBeep();
+    status(`Valor ≥ ${thr}€`, 'ok');
+  }else{
+    lastPrice.classList.remove('ok');
+    status('Detectat i valorat.');
+  }
+}
+
+function status(msg, cls){
+  statusEl.className = cls||'';
+  statusEl.textContent = msg||'';
+}
+
+// beep curt
+function alertBeep(){
+  if(!beepChk.checked) return;
+  try{
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
+    const o = ctx.createOscillator(); const g = ctx.createGain();
+    o.type='sine'; o.frequency.value=880;
+    o.connect(g); g.connect(ctx.destination);
+    g.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.4, ctx.currentTime+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime+0.25);
+    o.start(); o.stop(ctx.currentTime+0.26);
+  }catch(e){}
+}
+</script>
+</body>
+</html>
