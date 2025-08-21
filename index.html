@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>MTG PriceCam — amb overlay i debug</title>
+<title>MTG PriceCam — càmera OK + overlay + OpenCV (opcional)</title>
 <style>
   :root{font-family:system-ui,Arial,sans-serif}
   body{margin:10px}
@@ -29,7 +29,7 @@
 </style>
 </head>
 <body>
-<h1>Escàner MTG (overlay de debug + touch)</h1>
+<h1>Escàner MTG (permís càmera fiable, overlay, debug i OpenCV opcional)</h1>
 
 <div class="grid">
   <div>
@@ -44,6 +44,7 @@
         <label class="toggle"><input id="pause" type="checkbox"> Pausa</label>
         <label class="toggle"><input id="debug" type="checkbox"> Debug</label>
         <label class="toggle"><input id="preferEs" type="checkbox" checked> Preferir ES</label>
+        <label class="toggle"><input id="useCv" type="checkbox"> Auto-ROI (OpenCV)</label>
       </div>
       <div class="row" style="margin-top:6px">
         <label>Freq. (s): <input id="interval" type="number" min="0.4" step="0.1" value="1.0" class="pill"></label>
@@ -54,7 +55,7 @@
         <button id="editRoi" class="btn">Editar ROI: <span id="roiWhich">Codi</span></button>
       </div>
       <div id="status"></div>
-      <div class="note">Cal HTTPS o <code>localhost</code>. Toca vídeo per pausar/reprendre; doble-tap: mode debug; pinça: zoom (si suportat).</div>
+      <div class="note">Serveix la pàgina per <b>HTTPS</b> o <code>localhost</code>. Toca vídeo per pausar/reprendre; doble-tap: debug; pinça: zoom; pots arrossegar ROI.</div>
     </div>
 
     <div class="kvs">
@@ -85,161 +86,157 @@
   </div>
 </div>
 
-<!-- Tesseract: faig servir la versió 2, estable amb workers.
-     Si el worker no existeix, hi ha fallback automàtic a recognize() sense worker. -->
+<!-- OpenCV (opcional) -->
+<script defer src="https://docs.opencv.org/4.x/opencv.js" onload="window.cvReady=true;"></script>
+<!-- Tesseract 2.x + fallback sense worker -->
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@2.1.5/dist/tesseract.min.js"></script>
 <script>
-/* ============ Elements ============ */
-const video = document.getElementById('video');
-const ovl   = document.getElementById('ovl'); const octx = ovl.getContext('2d');
-const stage = document.getElementById('stage');
-const startBtn = document.getElementById('start'); const stopBtn = document.getElementById('stop');
-const pauseChk = document.getElementById('pause'); const debugChk = document.getElementById('debug');
-const preferEs = document.getElementById('preferEs'); const flipBtn = document.getElementById('flip');
-const intervalIn = document.getElementById('interval'); const thresholdIn = document.getElementById('threshold');
-const beepChk = document.getElementById('beep'); const zoomWrap = document.getElementById('zoomWrap');
-const zoomInput = document.getElementById('zoom'); const editRoiBtn = document.getElementById('editRoi'); const roiWhich = document.getElementById('roiWhich');
-const statusEl = document.getElementById('status'); const listEl = document.getElementById('list');
+/*** ---------- ELEMENTS & ESTAT ---------- ***/
+const video=document.getElementById('video'), stage=document.getElementById('stage');
+const ovl=document.getElementById('ovl'), octx=ovl.getContext('2d');
+const startBtn=document.getElementById('start'), stopBtn=document.getElementById('stop'), flipBtn=document.getElementById('flip');
+const pauseChk=document.getElementById('pause'), debugChk=document.getElementById('debug'), preferEs=document.getElementById('preferEs');
+const useCvChk=document.getElementById('useCv');
+const intervalIn=document.getElementById('interval'), thresholdIn=document.getElementById('threshold'), beepChk=document.getElementById('beep');
+const zoomWrap=document.getElementById('zoomWrap'), zoomInput=document.getElementById('zoom');
+const editRoiBtn=document.getElementById('editRoi'), roiWhich=document.getElementById('roiWhich');
+const statusEl=document.getElementById('status'), listEl=document.getElementById('list');
+const miniCode=document.getElementById('miniCode'), mctxC=miniCode.getContext('2d');
+const miniSet=document.getElementById('miniSet'), mctxS=miniSet.getContext('2d');
+const rawCodeEl=document.getElementById('rawCode'), rawSetEl=document.getElementById('rawSet');
+const lastCode=document.getElementById('lastCode'), lastSet=document.getElementById('lastSet'), lastPrice=document.getElementById('lastPrice'), explain=document.getElementById('explain');
 
-const miniCode = document.getElementById('miniCode'); const mctxC = miniCode.getContext('2d');
-const miniSet  = document.getElementById('miniSet');  const mctxS = miniSet.getContext('2d');
-const rawCodeEl = document.getElementById('rawCode'); const rawSetEl = document.getElementById('rawSet');
-
-const lastCode = document.getElementById('lastCode'); const lastSet = document.getElementById('lastSet');
-const lastPrice= document.getElementById('lastPrice'); const explain = document.getElementById('explain');
-
-/* ============ Estat ============ */
 let stream=null, track=null, running=false, facing='environment';
-let paused=false, debug=false, editing=false;
+let paused=false, debug=false, editing=false, editTarget='code';
 let scanning=false, timer=null, cooldownUntil=0, buffer=[], seenKeys=new Set();
-let pinchRefDist=null;
+let pinchRefDist=null, useWorker=false, worker=null, workerReady=false;
+let cvReady=false; // el posa l'script onload
 
-/* OCR */
-let worker=null, workerReady=false;
-let useWorker=false; // indicarem si tenim worker o si farem fallback a recognize()
-async function setupWorker(){
-  try{
-    if (Tesseract && typeof Tesseract.createWorker === 'function') {
-      const w = Tesseract.createWorker({ logger: m=>{} });
-      // alguns CDN retornen objectes “lite” sense load(); ho comprovem
-      if (w && typeof w.load === 'function') {
-        await w.load(); await w.loadLanguage('eng'); await w.initialize('eng');
-        await w.setParameters({ tessedit_pageseg_mode: 7 });
-        worker = w; workerReady = true; useWorker = true; status('OCR preparat (worker).'); return;
-      }
-    }
-    // Fallback sense worker
-    workerReady = true; useWorker = false; status('OCR preparat (sense worker).');
-  }catch(e){
-    // encara en fallback
-    workerReady = true; useWorker = false; status('OCR en mode simple. '+e.message);
-  }
-}
+/* canvasses offscreen */
+const frame=document.createElement('canvas'); const fctx=frame.getContext('2d',{willReadFrequently:true});
+const roiC=document.createElement('canvas'); const rctx=roiC.getContext('2d',{willReadFrequently:true});
 
-/* canvasses de treball */
-const work = document.createElement('canvas'); const wctx = work.getContext('2d',{willReadFrequently:true});
-const roiC = document.createElement('canvas'); const rctx = roiC.getContext('2d',{willReadFrequently:true});
+/*** ---------- ROI (percent) ---------- ***/
+const ROI={ code:{x:.03,y:.84,w:.44,h:.12}, set:{x:.35,y:.91,w:.30,h:.06} };
 
-/* ROIs (percentatges) — editables */
-const ROI = {
-  code: {x:.03, y:.84, w:.44, h:.12},
-  set : {x:.35, y:.91, w:.30, h:.06}
-};
-let editTarget = 'code';
-
-/* Helpers */
-const sleep = ms => new Promise(r=>setTimeout(r,ms));
-function status(msg){ statusEl.textContent = msg || ''; }
-function normDigits(s){
-  return (s||'').replace(/[Oo]/g,'0').replace(/[IÍìíl]/gi,'1').replace(/S/g,'5')
-    .replace(/B/g,'8').replace(/[—–]/g,'-').replace(/·/g,'.').trim();
-}
+/*** ---------- UTILITATS ---------- ***/
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function status(msg){ statusEl.textContent=msg||''; }
+function secureOk(){ return location.protocol==='https:' || location.hostname==='localhost' || location.hostname==='127.0.0.1'; }
+function normDigits(s){ return (s||'').replace(/[Oo]/g,'0').replace(/[IÍìíl]/gi,'1').replace(/S/g,'5').replace(/B/g,'8').replace(/[—–]/g,'-').replace(/·/g,'.').trim(); }
 function drawOverlay(step){
-  const r = stage.getBoundingClientRect(); ovl.width=r.width; ovl.height=r.height;
-  const W=ovl.width,H=ovl.height; octx.clearRect(0,0,W,H);
-  const rects=[
-    {...ROI.set,  color:'rgba(80,150,255,.9)', label:'SET•LANG'},
-    {...ROI.code, color:'rgba(60,220,120,.9)', label:'CODI'}
-  ];
-  rects.forEach(rr=>{
-    octx.strokeStyle=rr.color; octx.lineWidth=3; octx.strokeRect(rr.x*W, rr.y*H, rr.w*W, rr.h*H);
-    octx.fillStyle=rr.color; octx.fillRect(rr.x*W, rr.y*H-18, 90, 18);
-    octx.fillStyle='#000'; octx.font='12px system-ui'; octx.fillText(rr.label, rr.x*W+6, rr.y*H-5);
-  });
-  if(step){ octx.fillStyle='rgba(0,0,0,.45)'; octx.fillRect(0,0,120,22); octx.fillStyle='#fff'; octx.font='12px system-ui'; octx.fillText(step,6,15); }
-}
-async function applyZoom(v){
-  if(!track) return; const caps = track.getCapabilities?.(); if(!caps || !caps.zoom) return;
-  v=Math.max(caps.zoom.min, Math.min(caps.zoom.max, v)); await track.applyConstraints({advanced:[{zoom:v}]}); zoomInput.value=v;
+  const r=stage.getBoundingClientRect(); ovl.width=r.width; ovl.height=r.height; const W=ovl.width,H=ovl.height;
+  octx.clearRect(0,0,W,H);
+  const rects=[ {...ROI.set,color:'rgba(80,150,255,.9)',label:'SET•LANG'}, {...ROI.code,color:'rgba(60,220,120,.9)',label:'CODI'} ];
+  rects.forEach(rr=>{ octx.strokeStyle=rr.color; octx.lineWidth=3; octx.strokeRect(rr.x*W,rr.y*H,rr.w*W,rr.h*H);
+    octx.fillStyle=rr.color; octx.fillRect(rr.x*W, rr.y*H-18, 90, 18); octx.fillStyle='#000'; octx.font='12px system-ui'; octx.fillText(rr.label, rr.x*W+6, rr.y*H-5); });
+  if(step){ octx.fillStyle='rgba(0,0,0,.45)'; octx.fillRect(0,0,160,22); octx.fillStyle='#fff'; octx.font='12px system-ui'; octx.fillText(step, 6, 15); }
 }
 
-/* Càmera */
+/*** ---------- CÀMERA AMB FALLBACK ---------- ***/
+function gum(constraints){
+  if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) return navigator.mediaDevices.getUserMedia(constraints);
+  const legacy=navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+  return new Promise((res,rej)=> legacy ? legacy.call(navigator,constraints,res,rej) : rej(new Error('getUserMedia no suportat')));
+}
 async function startCam(){
-  // Demana permís primer; si falla, mostrem motiu
+  if(!secureOk()){ status('⚠️ Cal HTTPS o localhost per fer servir la càmera.'); return; }
   try{
-    stream = await navigator.mediaDevices.getUserMedia({
-      video:{facingMode:facing, width:{ideal:1280}, height:{ideal:960}, aspectRatio:{ideal:4/3}}
-    });
+    stream=await gum({ video:{facingMode:facing, width:{ideal:1280}, height:{ideal:960}, aspectRatio:{ideal:4/3}}, audio:false });
   }catch(e){
-    status('No s’ha pogut obrir la càmera: '+e.message+' (Assegura HTTPS o localhost, i que el navegador té permís)');
-    throw e;
+    status('No s’ha pogut obrir la càmera: '+e.name+' — '+e.message); console.error(e);
+    return;
   }
-  video.srcObject = stream; track = stream.getVideoTracks()[0];
-  const caps = track.getCapabilities?.(); if(caps && caps.zoom){ zoomWrap.style.display=''; zoomInput.min=caps.zoom.min; zoomInput.max=caps.zoom.max; zoomInput.step=0.1; zoomInput.value=caps.zoom.min||1; } else zoomWrap.style.display='none';
-  running = true; paused=false; pauseChk.checked=false; status('Càmera en marxa.'); tick(); // comença escaneig
-  // carrega l’OCR en paral·lel (per no bloquejar el prompt de permisos)
-  if(!workerReady) setupWorker();
+  video.srcObject=stream; track=stream.getVideoTracks()[0];
+  const caps=track.getCapabilities?.(); if(caps && caps.zoom){ zoomWrap.style.display=''; zoomInput.min=caps.zoom.min; zoomInput.max=caps.zoom.max; zoomInput.step=0.1; zoomInput.value=caps.zoom.min||1; } else zoomWrap.style.display='none';
+  running=true; paused=false; pauseChk.checked=false; status('Càmera en marxa. Toca el vídeo per pausar/reprendre.'); tick();
+  if(!workerReady) setupOCR(); // en paral·lel
 }
 function stopCam(){ running=false; if(timer) clearTimeout(timer); if(stream){ stream.getTracks().forEach(t=>t.stop()); } stream=null; track=null; status('Aturat.'); }
 
-/* OCR */
+/*** ---------- OCR AMB FALLBACK ---------- ***/
+async function setupOCR(){
+  try{
+    if(Tesseract && typeof Tesseract.createWorker==='function'){
+      const w=Tesseract.createWorker({logger:()=>{}});
+      if(w && typeof w.load==='function'){
+        await w.load(); await w.loadLanguage('eng'); await w.initialize('eng'); await w.setParameters({tessedit_pageseg_mode:7});
+        worker=w; useWorker=true; workerReady=true; status('OCR llest (worker).'); return;
+      }
+    }
+    workerReady=true; useWorker=false; status('OCR llest (mode simple).');
+  }catch(e){ workerReady=true; useWorker=false; status('OCR en mode simple. '+e.message); }
+}
+
+/*** ---------- OCR HELPERS ---------- ***/
 function rotateRect(r,deg){ if(deg%180===0) return r; return {x:1-(r.y+r.h), y:r.x, w:r.h, h:r.w}; }
-async function ocrRect(rect, deg, whitelist, outCanvas){
-  if(!workerReady) await setupWorker(); // per si l’usuari arrenca molt ràpid
-  const vw=video.videoWidth, vh=video.videoHeight; if(!vw||!vh) return '';
-  work.width=vw; work.height=vh; wctx.drawImage(video,0,0,vw,vh);
+async function ocrRect(sourceCanvas, rect, deg, whitelist, outCanvas){
+  const vw=sourceCanvas.width, vh=sourceCanvas.height;
   let r=rect; if(deg===90) r=rotateRect(rect,90); if(deg===180) r={x:1-(rect.x+rect.w), y:1-(rect.y+rect.h), w:rect.w, h:rect.h}; if(deg===270) r=rotateRect(rotateRect(rect,90),90);
   const sx=(r.x*vw)|0, sy=(r.y*vh)|0, sw=Math.max(2,(r.w*vw)|0), sh=Math.max(2,(r.h*vh)|0);
-  roiC.width=sw*2; roiC.height=sh*2; rctx.imageSmoothingEnabled=false; rctx.drawImage(work, sx,sy,sw,sh, 0,0,roiC.width,roiC.height);
-  const im=rctx.getImageData(0,0,roiC.width,roiC.height); const d=im.data;
+  roiC.width=sw*2; roiC.height=sh*2;
+  rctx.imageSmoothingEnabled=false; rctx.drawImage(sourceCanvas, sx,sy,sw,sh, 0,0,roiC.width,roiC.height);
+  const im=rctx.getImageData(0,0,roiC.width,roiC.height), d=im.data;
   for(let i=0;i<d.length;i+=4){ let y=0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]; y=(y-128)*1.8+128; const v=y<140?0:255; d[i]=d[i+1]=d[i+2]=v; d[i+3]=255; }
-  rctx.putImageData(im,0,0); if(outCanvas){ outCanvas.width=roiC.width; outCanvas.height=roiC.height; outCanvas.getContext('2d').drawImage(roiC,0,0); }
-
-  if(useWorker){
-    await worker.setParameters({ tessedit_char_whitelist: whitelist });
-    const { data } = await worker.recognize(roiC); return normDigits(data.text);
-  }else{
-    const { data } = await Tesseract.recognize(roiC,'eng',{ tessedit_pageseg_mode:7, tessedit_char_whitelist:whitelist });
-    return normDigits(data.text);
-  }
+  rctx.putImageData(im,0,0);
+  if(outCanvas){ outCanvas.width=roiC.width; outCanvas.height=roiC.height; outCanvas.getContext('2d').drawImage(roiC,0,0); }
+  if(useWorker){ await worker.setParameters({tessedit_char_whitelist:whitelist}); const {data}=await worker.recognize(roiC); return normDigits(data.text);}
+  const {data}=await Tesseract.recognize(roiC,'eng',{tessedit_pageseg_mode:7,tessedit_char_whitelist:whitelist}); return normDigits(data.text);
 }
-async function readSet(oriDeg){
-  const raw = await ocrRect(ROI.set, oriDeg, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ•★* -', miniSet);
-  rawSetEl.textContent = raw || '—';
-  const m = raw.match(/\b([A-Z]{2,5})\s*[•★\-\.\· ]\s*([A-Z]{2})\b/);
-  if(!m) return null; return { set:m[1].toUpperCase(), lang:m[2].toUpperCase() };
-}
-async function readCode(oriDeg){
-  const raw = await ocrRect(ROI.code, oriDeg, '0123456789/ CMURcmurSTabAB', miniCode);
-  rawCodeEl.textContent = raw || '—';
-  let m = raw.match(/(\d{1,4})\s*\/\s*(\d{2,4})\s*([A-Za-z])?/); // 039/302 C
-  if(m){ const num=String(+m[1]) + (/[a-z]$/i.test(m[1])?m[1].slice(-1).toLowerCase():''); const rarity=(m[3]||'').toUpperCase(); return { human:`${m[1]}/${m[2]} ${rarity||''}`.trim(), key:`A|${num}|${rarity}`, number:num, rarity }; }
-  m = raw.match(/\b([RCUMST])\s*0*([0-9]{1,4}[a-z]?)\b/i); // R 0006, C 12, 006a
-  if(m){ const rarity=(m[1]||'').toUpperCase(); const num=m[2].toLowerCase(); return { human:`${rarity?rarity+' ':''}${num}`, key:`B|${num}|${rarity}`, number:num, rarity }; }
+async function readSet(src,ori){ const raw=await ocrRect(src,ROI.set,ori,'ABCDEFGHIJKLMNOPQRSTUVWXYZ•★* -',miniSet); rawSetEl.textContent=raw||'—'; const m=raw.match(/\b([A-Z]{2,5})\s*[•★\-\.\· ]\s*([A-Z]{2})\b/); if(!m) return null; return {set:m[1].toUpperCase(),lang:m[2].toUpperCase()}; }
+async function readCode(src,ori){
+  const raw=await ocrRect(src,ROI.code,ori,'0123456789/ CMURcmurSTabAB',miniCode); rawCodeEl.textContent=raw||'—';
+  let m=raw.match(/(\d{1,4})\s*\/\s*(\d{2,4})\s*([A-Za-z])?/); if(m){ const num=String(+m[1]) + (/[a-z]$/i.test(m[1])?m[1].slice(-1).toLowerCase():''); const rarity=(m[3]||'').toUpperCase(); return {human:`${m[1]}/${m[2]} ${rarity||''}`.trim(), key:`A|${num}|${rarity}`, number:num, rarity}; }
+  m=raw.match(/\b([RCUMST])\s*0*([0-9]{1,4}[a-z]?)\b/i); if(m){ const rarity=(m[1]||'').toUpperCase(); const num=m[2].toLowerCase(); return {human:`${rarity?rarity+' ':''}${num}`, key:`B|${num}|${rarity}`, number:num, rarity}; }
   return null;
 }
 
-/* Loop */
-function schedule(){ if(!running) return; const ms=Math.max(250,Number(intervalIn.value)*1000); timer=setTimeout(tick,ms); }
+/*** ---------- OpenCV (auto-ROI) ---------- ***/
+function cvWarpToCard(){
+  if(!window.cvReady || !cv || !video.videoWidth) return null;
+  // dibuixa frame al canvas "frame"
+  frame.width=video.videoWidth; frame.height=video.videoHeight; fctx.drawImage(video,0,0,frame.width,frame.height);
+  const src=cv.imread(frame); let gray=new cv.Mat(); cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray,gray,new cv.Size(5,5),0); let edges=new cv.Mat(); cv.Canny(gray,edges,50,150);
+  let contours=new cv.MatVector(), hier=new cv.Mat(); cv.findContours(edges,contours,hier,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+  let best=null, bestArea=0, tmp=new cv.Mat();
+  for(let i=0;i<contours.size();i++){ const c=contours.get(i); const peri=cv.arcLength(c,true); cv.approxPolyDP(c,tmp,0.02*peri,true);
+    if(tmp.total()===4){ const area=cv.contourArea(tmp); if(area>bestArea){bestArea=area; best=tmp.clone();} } c.delete();
+  }
+  if(!best){ src.delete(); gray.delete(); edges.delete(); contours.delete(); hier.delete(); tmp.delete(); return null; }
+  // reordena punts TL,TR,BR,BL
+  let pts=[]; for(let i=0;i<4;i++){ const p=best.intPtr(i); pts.push({x:best.data32S[i*2], y:best.data32S[i*2+1]}); }
+  pts.sort((a,b)=>a.y-b.y); const top=pts.slice(0,2).sort((a,b)=>a.x-b.x), bot=pts.slice(2).sort((a,b)=>a.x-b.x);
+  const tl=top[0], tr=top[1], bl=bot[0], br=bot[1];
+  const W=744, H=1040; const dst=cv.Mat.zeros(H,W,cv.CV_8UC4);
+  const srcTri=cv.matFromArray(4,1,cv.CV_32FC2,[tl.x,tl.y, tr.x,tr.y, br.x,br.y, bl.x,bl.y]);
+  const dstTri=cv.matFromArray(4,1,cv.CV_32FC2,[0,0, W,0, W,H, 0,H]);
+  const M=cv.getPerspectiveTransform(srcTri,dstTri); cv.warpPerspective(src,dst,M,new cv.Size(W,H));
+  src.delete(); gray.delete(); edges.delete(); contours.delete(); hier.delete(); tmp.delete(); best.delete(); srcTri.delete(); dstTri.delete(); M.delete();
+  return dst; // cv.Mat
+}
+function matToCanvas(mat){
+  const c=document.createElement('canvas'); c.width=mat.cols; c.height=mat.rows; cv.imshow(c,mat); return c;
+}
+
+/*** ---------- LOOP ---------- ***/
+function schedule(){ if(!running) return; const ms=Math.max(250, Number(intervalIn.value)*1000); timer=setTimeout(tick, ms); }
 async function tick(){
-  if(!running || paused || scanning){ schedule(); return; }
+  if(!running || paused || scanning) { schedule(); return; }
   scanning=true;
   try{
-    drawOverlay(debug?'escanejant':'');
-    const oris=[0,180,90,270]; let foundSet=null, bestOri=0;
-    for(const o of oris){ if(debug) drawOverlay('ori '+o+'°'); const s=await readSet(o); if(s){ foundSet=s; bestOri=o; break; } }
-    const code=await readCode(bestOri);
-    if(foundSet) lastSet.textContent = `${foundSet.set} • ${foundSet.lang}`;
+    // prepara canvas de font: warp (si OpenCV activat i troba carta) o frame original
+    let srcCanvas;
+    if(useCvChk.checked && window.cvReady){ const warped=cvWarpToCard(); if(warped){ srcCanvas=matToCanvas(warped); warped.delete(); drawOverlay('OpenCV (warp)'); }
+      else { frame.width=video.videoWidth; frame.height=video.videoHeight; fctx.drawImage(video,0,0,frame.width,frame.height); srcCanvas=frame; drawOverlay('heurística'); } }
+    else { frame.width=video.videoWidth; frame.height=video.videoHeight; fctx.drawImage(video,0,0,frame.width,frame.height); srcCanvas=frame; drawOverlay(debug?'escanejant':''); }
+
+    // orientacions (si hi ha warp no cal provar 4, però ho deixo per seguretat)
+    const oris = useCvChk.checked ? [0] : [0,180,90,270];
+    let foundSet=null, bestOri=0;
+    for(const o of oris){ const s=await readSet(srcCanvas,o); if(s){ foundSet=s; bestOri=o; break; } }
+    const code=await readCode(srcCanvas,bestOri);
+    if(foundSet) lastSet.textContent=`${foundSet.set} • ${foundSet.lang}`;
     if(!code){ status('Sense codi…'); scanning=false; schedule(); return; }
 
     // validació doble
@@ -250,83 +247,68 @@ async function tick(){
     if(seenKeys.has(code.key) && now<cooldownUntil){ scanning=false; schedule(); return; }
     cooldownUntil=now+2000; seenKeys.add(code.key);
 
-    lastCode.textContent = code.human;
-    const res = await lookupPrice({ code, setInfo:foundSet, preferEs:preferEs.checked });
+    lastCode.textContent=code.human;
+    const res=await lookupPrice({code, setInfo:foundSet, preferEs:preferEs.checked});
     renderPrice(res);
   }catch(e){ console.error(e); status('Error: '+e.message); }
   finally{ scanning=false; schedule(); }
 }
 
-/* Scryfall */
+/*** ---------- SCRYFALL ---------- ***/
 async function fetchBySetAndNumber(set, number, lang){
   try{
-    const langPart = (lang && lang.toLowerCase()==='sp') ? '/es' : '';
-    const url = `https://api.scryfall.com/cards/${set.toLowerCase()}/${encodeURIComponent(number)}${langPart}`;
-    const r = await fetch(url); if(r.ok){ const j=await r.json(); return [j]; }
+    const langPart=(lang && lang.toLowerCase()==='sp')?'/es':'';
+    const url=`https://api.scryfall.com/cards/${set.toLowerCase()}/${encodeURIComponent(number)}${langPart}`;
+    const r=await fetch(url); if(r.ok){ const j=await r.json(); return [j]; }
   }catch(e){}
   return [];
 }
 async function scry(url){ try{ const r=await fetch(url); const j=await r.json(); return j.data||[]; }catch(e){ return []; } }
 async function lookupPrice({code, setInfo, preferEs}){
-  let data=[]; if(setInfo?.set){ data = await fetchBySetAndNumber(setInfo.set, code.number, setInfo.lang); }
+  let data=[]; if(setInfo?.set){ data=await fetchBySetAndNumber(setInfo.set, code.number, setInfo.lang); }
   if(!data.length){
-    let q = `number:${code.number}` + (setInfo?.set?` set:${setInfo.set.toLowerCase()}`:'') + (preferEs?' lang:es':'') + (code.rarity?` rarity:${code.rarity.toLowerCase()}`:'');
-    const url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&unique=prints&include_extras=false&order=eur&dir=desc`;
-    data = await scry(url);
+    let q=`number:${code.number}`+(setInfo?.set?` set:${setInfo.set.toLowerCase()}`:'')+(preferEs?' lang:es':'')+(code.rarity?` rarity:${code.rarity.toLowerCase()}`:'');
+    const url=`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&unique=prints&include_extras=false&order=eur&dir=desc`;
+    data=await scry(url);
   }
   if(!data.length) return {ok:false, why:'Sense resultats.'};
-  const items = data.map(c=>{ const p=c.prices||{}; const eur=+(p.eur||p.eur_foil||0); const usd=+(p.usd||p.usd_foil||p.usd_etched||0); return {card:c, eur, usd, best:(eur||usd||0)}; }).sort((a,b)=>b.best-a.best);
+  const items=data.map(c=>{ const p=c.prices||{}; const eur=+(p.eur||p.eur_foil||0); const usd=+(p.usd||p.usd_foil||p.usd_etched||0); return {card:c,eur,usd,best:(eur||usd||0)}; }).sort((a,b)=>b.best-a.best);
   const b=items[0];
   return { ok:true, name:b.card.name, set:b.card.set.toUpperCase(), lang:b.card.lang.toUpperCase(), number:b.card.collector_number, rarity:b.card.rarity, eur:b.eur||null, usd:b.usd||null, link:b.card.scryfall_uri||b.card.uri };
 }
 
-/* UI & so */
+/*** ---------- UI ---------- ***/
 function renderPrice(res){
   if(!res.ok){ lastPrice.textContent='—'; explain.textContent=res.why||'—'; return; }
-  lastSet.textContent = `${res.set} • ${res.lang}`;
-  lastPrice.innerHTML = `${res.eur?res.eur.toFixed(2)+' €':'—'} <span class="muted">(USD ${res.usd?res.usd.toFixed(2):'—'})</span>`;
-  explain.innerHTML = `${res.name} · #${res.number} · ${res.rarity} · <a href="${res.link}" target="_blank" rel="noopener">Scryfall</a>`;
+  lastSet.textContent=`${res.set} • ${res.lang}`;
+  lastPrice.innerHTML=`${res.eur?res.eur.toFixed(2)+' €':'—'} <span class="muted">(USD ${res.usd?res.usd.toFixed(2):'—'})</span>`;
+  explain.innerHTML=`${res.name} · #${res.number} · ${res.rarity} · <a href="${res.link}" target="_blank" rel="noopener">Scryfall</a>`;
   const row=document.createElement('div'); row.className='item';
-  row.innerHTML = `<div><b>${res.name}</b> (${res.set}) · #${res.number} · ${res.lang}</div>
-                   <div>Preu: <b>${res.eur?res.eur.toFixed(2)+' €':'—'}</b> <span class="muted">(USD ${res.usd?res.usd.toFixed(2):'—'})</span></div>`;
+  row.innerHTML=`<div><b>${res.name}</b> (${res.set}) · #${res.number} · ${res.lang}</div>
+                 <div>Preu: <b>${res.eur?res.eur.toFixed(2)+' €':'—'}</b> <span class="muted">(USD ${res.usd?res.usd.toFixed(2):'—'})</span></div>`;
   listEl.prepend(row);
   const thr=Number(thresholdIn.value)||0; if((res.eur||res.usd||0)>=thr) beep();
 }
 function beep(){ if(!beepChk.checked) return; const ctx=new (window.AudioContext||window.webkitAudioContext)(); const o=ctx.createOscillator(); const g=ctx.createGain(); o.frequency.value=920; o.connect(g); g.connect(ctx.destination); g.gain.setValueAtTime(0.0001, ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.45, ctx.currentTime+0.01); g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime+0.25); o.start(); o.stop(ctx.currentTime+0.26); }
 
-/* Controls */
-startBtn.onclick = async ()=>{ await startCam(); /* OCR s’inicialitza en paral·lel */ };
-stopBtn.onclick = stopCam;
-flipBtn.onclick = async()=>{ facing=(facing==='environment'?'user':'environment'); stopCam(); await sleep(150); startCam(); };
-zoomInput.oninput = e=>applyZoom(Number(e.target.value));
-pauseChk.onchange = e=>{ paused=e.target.checked; };
-debugChk.onchange = e=>{ debug=e.target.checked; drawOverlay(debug?'debug':''); };
+/*** ---------- CONTROLS ---------- ***/
+startBtn.onclick=async()=>{ await startCam(); };
+stopBtn.onclick=stopCam;
+flipBtn.onclick=async()=>{ facing=(facing==='environment'?'user':'environment'); stopCam(); await sleep(150); startCam(); };
+pauseChk.onchange=e=>{ paused=e.target.checked; };
+debugChk.onchange=e=>{ debug=e.target.checked; drawOverlay(debug?'debug':''); };
+zoomInput.oninput=e=>applyZoom(Number(e.target.value));
+editRoiBtn.onclick=()=>{ editing=!editing; editTarget=(editTarget==='code'?'set':'code'); roiWhich.textContent=(editTarget==='code'?'Codi':'Set'); };
 
-let lastTap=0; stage.addEventListener('click', e=>{ const now=Date.now(); if(now-lastTap<300){ debugChk.checked=!debugChk.checked; debug=!debug; drawOverlay(debug?'debug':''); } else { paused=!paused; pauseChk.checked=paused; } lastTap=now; });
+let lastTap=0;
+stage.addEventListener('click',e=>{ const now=Date.now(); if(now-lastTap<300){ debugChk.checked=!debugChk.checked; debug=!debug; drawOverlay(debug?'debug':''); } else { paused=!paused; pauseChk.checked=paused; } lastTap=now; });
+stage.addEventListener('touchstart',e=>{ if(e.touches.length===2){ const dx=e.touches[0].clientX-e.touches[1].clientX; const dy=e.touches[0].clientY-e.touches[1].clientY; pinchRefDist=Math.hypot(dx,dy);} },{passive:true});
+stage.addEventListener('touchmove',e=>{ if(pinchRefDist && e.touches.length===2){ const dx=e.touches[0].clientX-e.touches[1].clientX; const dy=e.touches[0].clientY-e.touches[1].clientY; const d=Math.hypot(dx,dy); const cur=Number(zoomInput.value||1); if(track) track.applyConstraints({advanced:[{zoom:cur*(d/pinchRefDist)}]}); pinchRefDist=d; } },{passive:false});
+stage.addEventListener('touchend',()=>{ pinchRefDist=null; });
 
-let pinchRefDist=null;
-stage.addEventListener('touchstart', e=>{ if(e.touches.length===2){ const dx=e.touches[0].clientX-e.touches[1].clientX; const dy=e.touches[0].clientY-e.touches[1].clientY; pinchRefDist=Math.hypot(dx,dy);} },{passive:true});
-stage.addEventListener('touchmove', e=>{ if(pinchRefDist && e.touches.length===2){ const dx=e.touches[0].clientX-e.touches[1].clientX; const dy=e.touches[0].clientY-e.touches[1].clientY; const d=Math.hypot(dx,dy); const cur=Number(zoomInput.value||1); applyZoom(cur*(d/pinchRefDist)); pinchRefDist=d; } },{passive:false});
-stage.addEventListener('touchend', ()=>{ pinchRefDist=null; });
-
-/* Edició ROI per tocar/arrelar */
-const roiBtn = document.getElementById('editRoi'); const roiWhich = document.getElementById('roiWhich');
-let editing=false, drag=null;
-editRoiBtn.onclick = ()=>{ editing=!editing; if(editing){ editTarget = (editTarget==='code'?'set':'code'); roiWhich.textContent = editTarget==='code'?'Codi':'Set'; } };
-ovl.addEventListener('touchstart', e=>{
-  if(!editing) return; const t=e.touches[0]; const r=ovl.getBoundingClientRect(); const x=(t.clientX-r.left)/r.width, y=(t.clientY-r.top)/r.height; drag={start:{x,y}, base:{...ROI[editTarget]}};
-},{passive:true});
-ovl.addEventListener('touchmove', e=>{
-  if(!editing||!drag) return; const t=e.touches[0]; const r=ovl.getBoundingClientRect(); const x=(t.clientX-r.left)/r.width, y=(t.clientY-r.top)/r.height; const dx=x-drag.start.x, dy=y-drag.start.y;
-  ROI[editTarget].x=Math.max(0,Math.min(1-ROI[editTarget].w, drag.base.x+dx));
-  ROI[editTarget].y=Math.max(0,Math.min(1-ROI[editTarget].h, drag.base.y+dy)); drawOverlay('edit');
-},{passive:false});
-ovl.addEventListener('touchend', ()=>{ drag=null; });
-
-/* Scheduler + overlay inicial */
 new ResizeObserver(()=>drawOverlay()).observe(stage);
-function schedule(){ if(!running) return; const ms=Math.max(250,Number(intervalIn.value)*1000); timer=setTimeout(tick,ms); }
 drawOverlay('esperant');
+function schedule(){ if(!running) return; const ms=Math.max(250, Number(intervalIn.value)*1000); timer=setTimeout(tick, ms); }
 </script>
 </body>
 </html>
