@@ -3,22 +3,23 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>MTG PriceCam — iPhone friendly</title>
+<title>MTG PriceCam — marcs alineats + touch fix</title>
 <style>
   :root{font-family:system-ui,Arial,sans-serif; --pad:12px;}
   body{margin:var(--pad); background:#fff;}
   h1{font-size:1.08rem;margin:0 0 8px}
-  /* Layout responsive */
+
+  /* Layout responsive: 1 columna en mòbil */
   .wrap{display:grid;grid-template-columns:1fr 420px;gap:12px;align-items:start}
-  @media (max-width: 900px){
-    .wrap{grid-template-columns:1fr}
-  }
+  @media (max-width: 900px){ .wrap{grid-template-columns:1fr} }
+
   /* Stage (vídeo) */
-  .stage{position:relative;border-radius:12px;overflow:hidden;background:#000; 
-         /* aspect ratio segur mentre no tenim metadata; després el fem dinàmic */
-         aspect-ratio: 4 / 3;}
-  video{width:100%;height:100%;display:block;object-fit:contain; background:#000;}
+  .stage{position:relative;border-radius:12px;overflow:hidden;background:#000; aspect-ratio:4/3;}
+  video{width:100%;height:100%;display:block;object-fit:contain;background:#000}
+  /* Overlay: per defecte no rep events; en edició sí */
   canvas.overlay{position:absolute;inset:0;pointer-events:none}
+  canvas.overlay.interactive{pointer-events:auto; touch-action:none; } /* permet drag sense scroll */
+
   /* Panells */
   .panel{border:1px solid #e6e6e6;border-radius:10px;padding:10px;background:#fafafa}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -29,24 +30,24 @@
   .item{border-top:1px dashed #ddd;padding:8px 0}
   code{background:#f4f4f4;padding:.1rem .25rem;border-radius:4px}
   .muted{color:#777}
-  /* Debug block plegable per a mòbil */
+
+  /* Debug plegable per no “xafar” en mòbil */
   details.debug{margin-top:8px}
   details.debug summary{cursor:pointer; padding:8px 10px; background:#f2f2f2; border-radius:8px;}
   .kvs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
   .kv{border:1px solid #eee;border-radius:8px;padding:6px;background:#fff}
   .mini{width:100%;aspect-ratio:3/1;border:1px dashed #ddd;border-radius:6px;display:block;background:#f8f8f8}
-  /* “Columna dreta” que ja no es xafa en mòbil */
+
   .right{display:grid;gap:8px}
 </style>
 </head>
 <body>
-<h1>Escàner MTG (overlay + debug + mòbil OK)</h1>
+<h1>Escàner MTG (overlay alineat + edició ROIs sense interferències)</h1>
 
 <div class="wrap">
-  <!-- ESQUERRA: Vídeo + controls bàsics -->
+  <!-- ESQUERRA -->
   <div>
     <div class="stage" id="stage">
-      <!-- 👇 Afegeixo autoplay playsinline muted perquè iOS el mostri i deixi fer play() -->
       <video id="video" autoplay playsinline muted></video>
       <canvas id="ovl" class="overlay"></canvas>
     </div>
@@ -56,6 +57,7 @@
         <button id="start" class="btn">Inicia càmera</button>
         <button id="stop" class="btn">Atura</button>
         <label class="pill"><input id="pause" type="checkbox"> Pausa</label>
+        <label class="pill"><input id="debug" type="checkbox"> Debug</label>
         <label class="pill"><input id="preferEs" type="checkbox" checked> Preferir ES</label>
         <label class="pill"><input id="useCv" type="checkbox"> Auto-ROI (OpenCV)</label>
       </div>
@@ -68,10 +70,9 @@
         <button id="editRoi" class="btn">Editar ROI: <span id="roiWhich">Codi</span></button>
       </div>
       <div id="status"></div>
-      <div class="muted" style="margin-top:6px">Serveix per <b>HTTPS</b> o <code>localhost</code>. Toca el vídeo per pausar; doble-tap: mostra overlay; pinça: zoom.</div>
+      <div class="muted" style="margin-top:6px">HTTPS o <code>localhost</code>. Tap al vídeo = pausa (només si no estàs editant). Debug es fa amb el botó.</div>
     </div>
 
-    <!-- Debug plegable (no aixafa res en mòbil) -->
     <details class="debug" id="dbgDetails">
       <summary>ROI i text OCR (debug)</summary>
       <div class="kvs">
@@ -89,7 +90,7 @@
     </details>
   </div>
 
-  <!-- DRETA: Resultats / Historial (en mòbil es posa sota, ample 100%) -->
+  <!-- DRETA -->
   <div class="right">
     <div class="panel">
       <div><b>Codi detectat:</b> <span id="lastCode">—</span></div>
@@ -109,12 +110,12 @@
 <!-- Tesseract 2.x + fallback sense worker -->
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@2.1.5/dist/tesseract.min.js"></script>
 <script>
-/* ====== Refs ====== */
+/* ====== refs ====== */
 const video = document.getElementById('video');
 const stage = document.getElementById('stage');
 const ovl = document.getElementById('ovl'); const octx = ovl.getContext('2d');
 const startBtn = document.getElementById('start'), stopBtn = document.getElementById('stop'), flipBtn = document.getElementById('flip');
-const pauseChk = document.getElementById('pause'), preferEs = document.getElementById('preferEs'), useCvChk = document.getElementById('useCv');
+const pauseChk = document.getElementById('pause'), debugChk = document.getElementById('debug'), preferEs = document.getElementById('preferEs'), useCvChk = document.getElementById('useCv');
 const intervalIn = document.getElementById('interval'), thresholdIn = document.getElementById('threshold'), beepChk = document.getElementById('beep');
 const zoomWrap = document.getElementById('zoomWrap'), zoomInput = document.getElementById('zoom');
 const editRoiBtn = document.getElementById('editRoi'), roiWhich = document.getElementById('roiWhich');
@@ -123,41 +124,75 @@ const miniCode = document.getElementById('miniCode'), mctxC = miniCode.getContex
 const miniSet  = document.getElementById('miniSet'),  mctxS = miniSet.getContext('2d');
 const rawCodeEl = document.getElementById('rawCode'), rawSetEl = document.getElementById('rawSet');
 const lastCode = document.getElementById('lastCode'), lastSet = document.getElementById('lastSet'), lastPrice = document.getElementById('lastPrice'), explain = document.getElementById('explain');
-const dbgDetails = document.getElementById('dbgDetails');
 
-/* ====== Estat ====== */
+/* ====== estat ====== */
 let stream=null, track=null, running=false, facing='environment';
-let paused=false, scanning=false, timer=null;
+let paused=false, scanning=false, timer=null, debug=false;
 let cooldownUntil=0, buffer=[], seenKeys=new Set();
 let useWorker=false, worker=null, workerReady=false;
+let editing=false, editTarget='code';
 let pinchRefDist=null;
 
 /* canvasses offscreen */
 const frame=document.createElement('canvas'); const fctx=frame.getContext('2d',{willReadFrequently:true});
 const roiC=document.createElement('canvas'); const rctx=roiC.getContext('2d',{willReadFrequently:true});
+const work=document.createElement('canvas'); const wctx=work.getContext('2d',{willReadFrequently:true});
 
-/* ROIs */
+/* ROIs en percentatge de l’àrea visible del vídeo (no del contenidor) */
 const ROI={ code:{x:.03,y:.84,w:.44,h:.12}, set:{x:.35,y:.91,w:.30,h:.06} };
-let editing=false, editTarget='code';
 
-/* Utils */
+/* ====== utilitats ====== */
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function status(msg){ statusEl.textContent = msg || ''; }
 function secureOk(){ return location.protocol==='https:' || location.hostname==='localhost' || location.hostname==='127.0.0.1'; }
 function normDigits(s){ return (s||'').replace(/[Oo]/g,'0').replace(/[IÍìíl]/gi,'1').replace(/S/g,'5').replace(/B/g,'8').replace(/[—–]/g,'-').replace(/·/g,'.').trim(); }
-function drawOverlay(step){
-  const r=stage.getBoundingClientRect(); ovl.width=r.width; ovl.height=r.height;
-  const W=ovl.width,H=ovl.height; octx.clearRect(0,0,W,H);
-  const rects=[ {...ROI.set,color:'rgba(80,150,255,.9)',label:'SET•LANG'}, {...ROI.code,color:'rgba(60,220,120,.9)',label:'CODI'} ];
-  rects.forEach(rr=>{
-    octx.strokeStyle=rr.color; octx.lineWidth=3; octx.strokeRect(rr.x*W,rr.y*H,rr.w*W,rr.h*H);
-    octx.fillStyle=rr.color; octx.fillRect(rr.x*W, rr.y*H-18, 90, 18);
-    octx.fillStyle='#000'; octx.font='12px system-ui'; octx.fillText(rr.label, rr.x*W+6, rr.y*H-5);
-  });
-  if(step){ octx.fillStyle='rgba(0,0,0,.45)'; octx.fillRect(0,0,200,22); octx.fillStyle='#fff'; octx.font='12px system-ui'; octx.fillText(step,6,15); }
+
+/* Rectangle real del vídeo dins el contenidor (per object-fit: contain) */
+function getDisplayedVideoRect(){
+  const r = stage.getBoundingClientRect();
+  const boxW = r.width, boxH = r.height;
+  const vw = video.videoWidth || 4, vh = video.videoHeight || 3;
+  const videoAR = vw / vh, boxAR = boxW / boxH;
+  let w, h, x, y;
+  if (videoAR > boxAR) { // barres a dalt/baix
+    w = boxW; h = boxW / videoAR; x = 0; y = (boxH - h) / 2;
+  } else { // barres als costats
+    h = boxH; w = boxH * videoAR; x = (boxW - w) / 2; y = 0;
+  }
+  return {x,y,w,h, boxW, boxH};
 }
 
-/* ====== CÀMERA (amb fixes iOS) ====== */
+/* Dibuixa overlay exactament sobre l'àrea visible */
+function drawOverlay(step){
+  const dpr = window.devicePixelRatio || 1;
+  const rect = stage.getBoundingClientRect();
+  ovl.style.width = rect.width + 'px';
+  ovl.style.height = rect.height + 'px';
+  ovl.width  = Math.round(rect.width * dpr);
+  ovl.height = Math.round(rect.height * dpr);
+  octx.setTransform(dpr,0,0,dpr,0,0);
+  octx.clearRect(0,0,rect.width,rect.height);
+
+  const vis = getDisplayedVideoRect(); // {x,y,w,h}
+  const toAbs = r => ({ x: vis.x + r.x*vis.w, y: vis.y + r.y*vis.h, w: r.w*vis.w, h: r.h*vis.h });
+
+  const rects = [
+    { ...toAbs(ROI.set),  color:'rgba(80,150,255,.9)', label:'SET•LANG' },
+    { ...toAbs(ROI.code), color:'rgba(60,220,120,.9)', label:'CODI' }
+  ];
+  octx.lineWidth = 3;
+  rects.forEach(rr=>{
+    octx.strokeStyle = rr.color; octx.strokeRect(rr.x, rr.y, rr.w, rr.h);
+    octx.fillStyle = rr.color; octx.fillRect(rr.x, rr.y-18, 90, 18);
+    octx.fillStyle = '#000'; octx.font = '12px system-ui'; octx.fillText(rr.label, rr.x+6, rr.y-5);
+  });
+  if(step){
+    octx.fillStyle='rgba(0,0,0,.45)'; octx.fillRect(vis.x, vis.y, 160, 22);
+    octx.fillStyle='#fff'; octx.font='12px system-ui'; octx.fillText(step, vis.x+6, vis.y+15);
+  }
+}
+
+/* ====== CÀMERA ====== */
 function gum(constraints){
   if(navigator.mediaDevices?.getUserMedia) return navigator.mediaDevices.getUserMedia(constraints);
   const legacy=navigator.getUserMedia||navigator.webkitGetUserMedia||navigator.mozGetUserMedia;
@@ -170,17 +205,9 @@ async function startCam(){
   }catch(e){ status('No s’ha pogut obrir la càmera: '+e.name+' — '+e.message); return; }
 
   video.srcObject = stream;
-  video.muted = true; // iOS
-  video.setAttribute('playsinline',''); video.setAttribute('autoplay',''); // iOS
-  try { await video.play(); } catch(e) { /* alguns navegadors la comencen sols */ }
-
-  // Ajusta l’aspect-ratio real del contenidor quan tenim metadata (evita vídeo invisible/zero height)
-  video.onloadedmetadata = ()=>{
-    // convertim el contenidor a la relació real del stream
-    const ar = (video.videoWidth && video.videoHeight) ? (video.videoWidth / video.videoHeight) : (4/3);
-    stage.style.aspectRatio = `${ar} / 1`;
-    drawOverlay();
-  };
+  video.muted = true; video.setAttribute('playsinline',''); video.setAttribute('autoplay','');
+  try{ await video.play(); }catch(e){}
+  video.onloadedmetadata = ()=>{ stage.style.aspectRatio = (video.videoWidth/video.videoHeight) + ' / 1'; drawOverlay(); };
 
   track = stream.getVideoTracks()[0];
   const caps=track.getCapabilities?.(); if(caps?.zoom){ zoomWrap.style.display=''; zoomInput.min=caps.zoom.min; zoomInput.max=caps.zoom.max; zoomInput.step=0.1; zoomInput.value=caps.zoom.min||1; } else zoomWrap.style.display='none';
@@ -204,7 +231,6 @@ async function setupOCR(){
 }
 
 /* ====== OCR helpers ====== */
-const work=document.createElement('canvas'); const wctx=work.getContext('2d',{willReadFrequently:true});
 function rotateRect(r,deg){ if(deg%180===0) return r; return {x:1-(r.y+r.h), y:r.x, w:r.h, h:r.w}; }
 async function ocrRect(sourceCanvas, rect, deg, whitelist, outCanvas){
   const vw=sourceCanvas.width, vh=sourceCanvas.height;
@@ -251,16 +277,16 @@ function cvWarpToCard(){
 }
 function matToCanvas(mat){ const c=document.createElement('canvas'); c.width=mat.cols; c.height=mat.rows; cv.imshow(c,mat); return c; }
 
-/* ====== Loop ====== */
+/* ====== LOOP ====== */
 function schedule(){ if(!running) return; const ms=Math.max(250, Number(intervalIn.value)*1000); timer=setTimeout(tick, ms); }
 async function tick(){
   if(!running || paused || scanning) { schedule(); return; }
   scanning=true;
   try{
-    // Font: warp (si OpenCV + activat), sinó frame cru
+    // Font per OCR: warp (si OpenCV + activat), sinó frame cru
     let srcCanvas;
     if(useCvChk.checked && window.cvReady){ const warped=cvWarpToCard(); if(warped){ srcCanvas=matToCanvas(warped); warped.delete(); drawOverlay('OpenCV (warp)'); } else { srcCanvas=grabFrame(); drawOverlay('heurística'); } }
-    else { srcCanvas=grabFrame(); drawOverlay(); }
+    else { srcCanvas=grabFrame(); drawOverlay(debug?'escanejant':''); }
 
     const oris = (srcCanvas===frame) ? [0,180,90,270] : [0];
     let foundSet=null, bestOri=0;
@@ -325,29 +351,48 @@ startBtn.onclick = async()=>{ await startCam(); };
 stopBtn.onclick  = stopCam;
 flipBtn.onclick  = async()=>{ facing=(facing==='environment'?'user':'environment'); stopCam(); await sleep(150); startCam(); };
 pauseChk.onchange = e=>{ paused=e.target.checked; };
+debugChk.onchange = e=>{ debug=e.target.checked; drawOverlay(debug?'debug':''); };
 zoomInput.oninput = e=>{ const v=Number(e.target.value); if(track?.applyConstraints){ track.applyConstraints({advanced:[{zoom:v}]}); } };
-editRoiBtn.onclick = ()=>{ editing=!editing; editTarget=(editTarget==='code'?'set':'code'); roiWhich.textContent=(editTarget==='code'?'Codi':'Set'); };
-/* tocar vídeo → pausa; doble-tap → obre/plega debug */
-let lastTap=0; stage.addEventListener('click',()=>{ const now=Date.now(); if(now-lastTap<300){ dbgDetails.open=!dbgDetails.open; } else { paused=!paused; pauseChk.checked=paused; } lastTap=now; });
 
-/* arrossegar ROI seleccionat */
-ovl.addEventListener('touchstart',e=>{
-  if(!editing) return; const t=e.touches[0]; const r=ovl.getBoundingClientRect(); const x=(t.clientX-r.left)/r.width, y=(t.clientY-r.top)/r.height;
-  window._drag={start:{x,y}, base:{...ROI[editTarget]}};
+/* Editar ROI (activa pointer-events a l’overlay i evita que el tap pausi) */
+editRoiBtn.onclick = ()=>{
+  editing=!editing;
+  ovl.classList.toggle('interactive', editing);
+  editTarget=(editTarget==='code'?'set':'code');
+  roiWhich.textContent=(editTarget==='code'?'Codi':'Set');
+};
+/* drag sobre overlay: mou ROI seleccionat (coordenades relatives al vídeo visible) */
+let drag=null;
+ovl.addEventListener('touchstart', e=>{
+  if(!editing) return;
+  e.stopPropagation();
+  const t=e.touches[0]; const r=stage.getBoundingClientRect();
+  const vis=getDisplayedVideoRect();
+  const x=(t.clientX - r.left - vis.x)/vis.w;
+  const y=(t.clientY - r.top  - vis.y)/vis.h;
+  drag={start:{x,y}, base:{...ROI[editTarget]}};
 },{passive:true});
-ovl.addEventListener('touchmove',e=>{
-  if(!editing || !window._drag) return; const t=e.touches[0]; const r=ovl.getBoundingClientRect(); const x=(t.clientX-r.left)/r.width, y=(t.clientY-r.top)/r.height;
-  const dx=x-window._drag.start.x, dy=y-window._drag.start.y;
-  ROI[editTarget].x=Math.max(0,Math.min(1-ROI[editTarget].w, window._drag.base.x+dx));
-  ROI[editTarget].y=Math.max(0,Math.min(1-ROI[editTarget].h, window._drag.base.y+dy));
+ovl.addEventListener('touchmove', e=>{
+  if(!editing || !drag) return;
+  e.stopPropagation(); e.preventDefault();
+  const t=e.touches[0]; const r=stage.getBoundingClientRect();
+  const vis=getDisplayedVideoRect();
+  const x=(t.clientX - r.left - vis.x)/vis.w;
+  const y=(t.clientY - r.top  - vis.y)/vis.h;
+  const dx=x-drag.start.x, dy=y-drag.start.y;
+  ROI[editTarget].x=Math.max(0,Math.min(1-ROI[editTarget].w, drag.base.x+dx));
+  ROI[editTarget].y=Math.max(0,Math.min(1-ROI[editTarget].h, drag.base.y+dy));
   drawOverlay('editant ROI');
 },{passive:false});
-ovl.addEventListener('touchend',()=>{ window._drag=null; });
+ovl.addEventListener('touchend', e=>{ if(!editing) return; e.stopPropagation(); drag=null; });
 
-/* overlay sempre a mida del vídeo */
+/* Tap per pausar: només quan NO estàs editant */
+stage.addEventListener('click', ()=>{ if(!editing){ paused=!paused; pauseChk.checked=paused; } });
+
+/* overlay sempre alineat */
 new ResizeObserver(()=>drawOverlay()).observe(stage);
 
-/* planificador */
+/* planificador + “frame grabber” */
 function schedule(){ if(!running) return; const ms=Math.max(250, Number(intervalIn.value)*1000); timer=setTimeout(tick, ms); }
 function grabFrame(){ frame.width=video.videoWidth; frame.height=video.videoHeight; fctx.drawImage(video,0,0,frame.width,frame.height); return frame; }
 </script>
