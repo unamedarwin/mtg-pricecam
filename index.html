@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>MTG PriceCam — debug overlay + touch</title>
+<title>MTG PriceCam — amb overlay i debug</title>
 <style>
   :root{font-family:system-ui,Arial,sans-serif}
   body{margin:10px}
   h1{font-size:1.08rem;margin:0 0 8px}
   .grid{display:grid;grid-template-columns:minmax(280px,420px) 1fr;gap:12px;align-items:start}
-  .stage{position:relative;border-radius:12px;overflow:hidden}
-  video{width:100%;height:auto;background:#000;display:block}
+  .stage{position:relative;border-radius:12px;overflow:hidden;background:#000}
+  video{width:100%;display:block}
   canvas.overlay{position:absolute;inset:0;pointer-events:none}
   .panel{border:1px solid #e6e6e6;border-radius:10px;padding:10px;background:#fafafa}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -24,13 +24,12 @@
   .item{border-top:1px dashed #ddd;padding:8px 0}
   code{background:#f4f4f4;padding:.1rem .25rem;border-radius:4px}
   .muted{color:#777}
-  .tag{display:inline-block;border:1px solid #ddd;border-radius:999px;padding:.1rem .4rem;background:#fff;margin-left:.35rem}
   .toggle{display:inline-flex;align-items:center;gap:.35rem;padding:.2rem .5rem;border:1px solid #bbb;border-radius:999px;background:#fff}
   .note{font-size:.9rem;color:#666}
 </style>
 </head>
 <body>
-<h1>Escàner MTG (amb overlay de debug i controls tàctils)</h1>
+<h1>Escàner MTG (overlay de debug + touch)</h1>
 
 <div class="grid">
   <div>
@@ -55,7 +54,7 @@
         <button id="editRoi" class="btn">Editar ROI: <span id="roiWhich">Codi</span></button>
       </div>
       <div id="status"></div>
-      <div class="note">Toca el vídeo per <b>pausar/reprendre</b>. Doble-tap: activa/desactiva <b>Debug</b>. Pinça per fer <b>zoom</b> si la teva càmera ho permet.</div>
+      <div class="note">Cal HTTPS o <code>localhost</code>. Toca vídeo per pausar/reprendre; doble-tap: mode debug; pinça: zoom (si suportat).</div>
     </div>
 
     <div class="kvs">
@@ -86,12 +85,13 @@
   </div>
 </div>
 
-<!-- Tesseract -->
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
+<!-- Tesseract: faig servir la versió 2, estable amb workers.
+     Si el worker no existeix, hi ha fallback automàtic a recognize() sense worker. -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@2.1.5/dist/tesseract.min.js"></script>
 <script>
-/* ===== Elements ===== */
+/* ============ Elements ============ */
 const video = document.getElementById('video');
-const ovl = document.getElementById('ovl'); const octx = ovl.getContext('2d');
+const ovl   = document.getElementById('ovl'); const octx = ovl.getContext('2d');
 const stage = document.getElementById('stage');
 const startBtn = document.getElementById('start'); const stopBtn = document.getElementById('stop');
 const pauseChk = document.getElementById('pause'); const debugChk = document.getElementById('debug');
@@ -106,179 +106,138 @@ const miniSet  = document.getElementById('miniSet');  const mctxS = miniSet.getC
 const rawCodeEl = document.getElementById('rawCode'); const rawSetEl = document.getElementById('rawSet');
 
 const lastCode = document.getElementById('lastCode'); const lastSet = document.getElementById('lastSet');
-const lastPrice = document.getElementById('lastPrice'); const explain = document.getElementById('explain');
+const lastPrice= document.getElementById('lastPrice'); const explain = document.getElementById('explain');
 
-/* ===== State ===== */
+/* ============ Estat ============ */
 let stream=null, track=null, running=false, facing='environment';
-let worker=null, workerReady=false, scanning=false, timer=null;
-let cooldownUntil=0, buffer=[], seenKeys=new Set();
 let paused=false, debug=false, editing=false;
+let scanning=false, timer=null, cooldownUntil=0, buffer=[], seenKeys=new Set();
 let pinchRefDist=null;
 
-/* Work canvasses (offscreen) */
+/* OCR */
+let worker=null, workerReady=false;
+let useWorker=false; // indicarem si tenim worker o si farem fallback a recognize()
+async function setupWorker(){
+  try{
+    if (Tesseract && typeof Tesseract.createWorker === 'function') {
+      const w = Tesseract.createWorker({ logger: m=>{} });
+      // alguns CDN retornen objectes “lite” sense load(); ho comprovem
+      if (w && typeof w.load === 'function') {
+        await w.load(); await w.loadLanguage('eng'); await w.initialize('eng');
+        await w.setParameters({ tessedit_pageseg_mode: 7 });
+        worker = w; workerReady = true; useWorker = true; status('OCR preparat (worker).'); return;
+      }
+    }
+    // Fallback sense worker
+    workerReady = true; useWorker = false; status('OCR preparat (sense worker).');
+  }catch(e){
+    // encara en fallback
+    workerReady = true; useWorker = false; status('OCR en mode simple. '+e.message);
+  }
+}
+
+/* canvasses de treball */
 const work = document.createElement('canvas'); const wctx = work.getContext('2d',{willReadFrequently:true});
 const roiC = document.createElement('canvas'); const rctx = roiC.getContext('2d',{willReadFrequently:true});
 
-/* ===== ROIs ===== */
-// Percentatges sobre el frame (0..1). Es poden arrossegar en mode Edició.
+/* ROIs (percentatges) — editables */
 const ROI = {
   code: {x:.03, y:.84, w:.44, h:.12},
   set : {x:.35, y:.91, w:.30, h:.06}
 };
-let editTarget = 'code'; // 'code' | 'set'
+let editTarget = 'code';
 
-/* ===== Helpers ===== */
+/* Helpers */
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
 function status(msg){ statusEl.textContent = msg || ''; }
 function normDigits(s){
-  return (s||'')
-    .replace(/[Oo]/g,'0').replace(/[IÍìíl]/gi,'1')
-    .replace(/S/g,'5').replace(/B/g,'8').replace(/[—–]/g,'-')
-    .replace(/·/g,'.').trim();
+  return (s||'').replace(/[Oo]/g,'0').replace(/[IÍìíl]/gi,'1').replace(/S/g,'5')
+    .replace(/B/g,'8').replace(/[—–]/g,'-').replace(/·/g,'.').trim();
 }
 function drawOverlay(step){
-  const r = stage.getBoundingClientRect();
-  ovl.width = r.width; ovl.height = r.height;
-  const W = ovl.width, H = ovl.height;
-  octx.clearRect(0,0,W,H);
-  const rects = [
+  const r = stage.getBoundingClientRect(); ovl.width=r.width; ovl.height=r.height;
+  const W=ovl.width,H=ovl.height; octx.clearRect(0,0,W,H);
+  const rects=[
     {...ROI.set,  color:'rgba(80,150,255,.9)', label:'SET•LANG'},
     {...ROI.code, color:'rgba(60,220,120,.9)', label:'CODI'}
   ];
   rects.forEach(rr=>{
-    octx.strokeStyle = rr.color; octx.lineWidth = 3;
-    octx.strokeRect(rr.x*W, rr.y*H, rr.w*W, rr.h*H);
-    octx.fillStyle = rr.color;
-    octx.fillRect(rr.x*W, rr.y*H-18, 90, 18);
-    octx.fillStyle = '#000'; octx.font = '12px system-ui';
-    octx.fillText(rr.label, rr.x*W+6, rr.y*H-5);
+    octx.strokeStyle=rr.color; octx.lineWidth=3; octx.strokeRect(rr.x*W, rr.y*H, rr.w*W, rr.h*H);
+    octx.fillStyle=rr.color; octx.fillRect(rr.x*W, rr.y*H-18, 90, 18);
+    octx.fillStyle='#000'; octx.font='12px system-ui'; octx.fillText(rr.label, rr.x*W+6, rr.y*H-5);
   });
-  if(step){
-    octx.fillStyle = 'rgba(0,0,0,.45)'; octx.fillRect(0,0,120,22);
-    octx.fillStyle = '#fff'; octx.font='12px system-ui';
-    octx.fillText(step, 6, 15);
-  }
+  if(step){ octx.fillStyle='rgba(0,0,0,.45)'; octx.fillRect(0,0,120,22); octx.fillStyle='#fff'; octx.font='12px system-ui'; octx.fillText(step,6,15); }
 }
-/* pinch zoom (si la càmera ho suporta) */
 async function applyZoom(v){
-  if(!track) return;
-  const caps = track.getCapabilities?.();
-  if(!caps || !caps.zoom) return;
-  v = Math.max(caps.zoom.min, Math.min(caps.zoom.max, v));
-  await track.applyConstraints({advanced:[{zoom:v}]});
-  zoomInput.value = v;
+  if(!track) return; const caps = track.getCapabilities?.(); if(!caps || !caps.zoom) return;
+  v=Math.max(caps.zoom.min, Math.min(caps.zoom.max, v)); await track.applyConstraints({advanced:[{zoom:v}]}); zoomInput.value=v;
 }
 
-/* ===== Tesseract ===== */
-async function setupWorker(){
-  worker = Tesseract.createWorker({ logger: m=>{} });
-  await worker.load(); await worker.loadLanguage('eng'); await worker.initialize('eng');
-  await worker.setParameters({ tessedit_pageseg_mode: 7 });
-  workerReady=true; status('OCR llest.');
-}
-
-/* ===== Camera ===== */
+/* Càmera */
 async function startCam(){
+  // Demana permís primer; si falla, mostrem motiu
   try{
     stream = await navigator.mediaDevices.getUserMedia({
-      video:{facingMode: facing, width:{ideal:1280}, height:{ideal:960}, aspectRatio:{ideal:4/3}}
+      video:{facingMode:facing, width:{ideal:1280}, height:{ideal:960}, aspectRatio:{ideal:4/3}}
     });
-    video.srcObject = stream;
-    track = stream.getVideoTracks()[0];
-    // zoom slider if supported
-    const caps = track.getCapabilities?.();
-    if(caps && caps.zoom){ zoomWrap.style.display=''; zoomInput.min=caps.zoom.min; zoomInput.max=caps.zoom.max; zoomInput.step=0.1; zoomInput.value=caps.zoom.min||1; }
-    else zoomWrap.style.display='none';
-
-    running=true; paused=false; pauseChk.checked=false;
-    status('Càmera en marxa.'); tick(); // comença immediatament
-  }catch(e){ status('Error càmera: '+e.message); }
-}
-function stopCam(){
-  running=false; if(timer) clearTimeout(timer);
-  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; track=null; }
-  status('Aturat.');
-}
-
-/* ===== OCR per ROI/orientació ===== */
-function rotateRect(r,deg){
-  if(deg%180===0) return r;
-  return {x:1-(r.y+r.h), y:r.x, w:r.h, h:r.w}; // 90° CW sobre [0,1]x[0,1]
-}
-async function ocrRect(rect, deg, whitelist, outCanvas){
-  const vw = video.videoWidth, vh = video.videoHeight;
-  if(!vw||!vh) return '';
-  work.width=vw; work.height=vh;
-  const ctx = work.getContext('2d', {willReadFrequently:true});
-  ctx.drawImage(video,0,0,vw,vh);
-
-  let r = rect;
-  if(deg===90) r = rotateRect(rect,90);
-  if(deg===180) r = {x:1-(rect.x+rect.w), y:1-(rect.y+rect.h), w:rect.w, h:rect.h};
-  if(deg===270) r = rotateRect(rotateRect(rect,90),90);
-
-  const sx = Math.max(0, (r.x*vw)|0);
-  const sy = Math.max(0, (r.y*vh)|0);
-  const sw = Math.max(2, (r.w*vw)|0);
-  const sh = Math.max(2, (r.h*vh)|0);
-
-  // preprocess: 2x, gris, contrast + binarització
-  roiC.width=sw*2; roiC.height=sh*2;
-  rctx.imageSmoothingEnabled=false;
-  rctx.drawImage(work, sx,sy,sw,sh, 0,0,roiC.width,roiC.height);
-  const im = rctx.getImageData(0,0,roiC.width,roiC.height); const d = im.data;
-  for(let i=0;i<d.length;i+=4){
-    let y = 0.2126*d[i] + 0.7152*d[i+1] + 0.0722*d[i+2];
-    y = (y-128)*1.8 + 128;
-    const v = y<140?0:255;
-    d[i]=d[i+1]=d[i+2]=v; d[i+3]=255;
+  }catch(e){
+    status('No s’ha pogut obrir la càmera: '+e.message+' (Assegura HTTPS o localhost, i que el navegador té permís)');
+    throw e;
   }
-  rctx.putImageData(im,0,0);
-  if(outCanvas){ outCanvas.width=roiC.width; outCanvas.height=roiC.height; outCanvas.getContext('2d').drawImage(roiC,0,0); }
+  video.srcObject = stream; track = stream.getVideoTracks()[0];
+  const caps = track.getCapabilities?.(); if(caps && caps.zoom){ zoomWrap.style.display=''; zoomInput.min=caps.zoom.min; zoomInput.max=caps.zoom.max; zoomInput.step=0.1; zoomInput.value=caps.zoom.min||1; } else zoomWrap.style.display='none';
+  running = true; paused=false; pauseChk.checked=false; status('Càmera en marxa.'); tick(); // comença escaneig
+  // carrega l’OCR en paral·lel (per no bloquejar el prompt de permisos)
+  if(!workerReady) setupWorker();
+}
+function stopCam(){ running=false; if(timer) clearTimeout(timer); if(stream){ stream.getTracks().forEach(t=>t.stop()); } stream=null; track=null; status('Aturat.'); }
 
-  await worker.setParameters({ tessedit_char_whitelist: whitelist });
-  const { data } = await worker.recognize(roiC);
-  return normDigits(data.text);
+/* OCR */
+function rotateRect(r,deg){ if(deg%180===0) return r; return {x:1-(r.y+r.h), y:r.x, w:r.h, h:r.w}; }
+async function ocrRect(rect, deg, whitelist, outCanvas){
+  if(!workerReady) await setupWorker(); // per si l’usuari arrenca molt ràpid
+  const vw=video.videoWidth, vh=video.videoHeight; if(!vw||!vh) return '';
+  work.width=vw; work.height=vh; wctx.drawImage(video,0,0,vw,vh);
+  let r=rect; if(deg===90) r=rotateRect(rect,90); if(deg===180) r={x:1-(rect.x+rect.w), y:1-(rect.y+rect.h), w:rect.w, h:rect.h}; if(deg===270) r=rotateRect(rotateRect(rect,90),90);
+  const sx=(r.x*vw)|0, sy=(r.y*vh)|0, sw=Math.max(2,(r.w*vw)|0), sh=Math.max(2,(r.h*vh)|0);
+  roiC.width=sw*2; roiC.height=sh*2; rctx.imageSmoothingEnabled=false; rctx.drawImage(work, sx,sy,sw,sh, 0,0,roiC.width,roiC.height);
+  const im=rctx.getImageData(0,0,roiC.width,roiC.height); const d=im.data;
+  for(let i=0;i<d.length;i+=4){ let y=0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]; y=(y-128)*1.8+128; const v=y<140?0:255; d[i]=d[i+1]=d[i+2]=v; d[i+3]=255; }
+  rctx.putImageData(im,0,0); if(outCanvas){ outCanvas.width=roiC.width; outCanvas.height=roiC.height; outCanvas.getContext('2d').drawImage(roiC,0,0); }
+
+  if(useWorker){
+    await worker.setParameters({ tessedit_char_whitelist: whitelist });
+    const { data } = await worker.recognize(roiC); return normDigits(data.text);
+  }else{
+    const { data } = await Tesseract.recognize(roiC,'eng',{ tessedit_pageseg_mode:7, tessedit_char_whitelist:whitelist });
+    return normDigits(data.text);
+  }
 }
 async function readSet(oriDeg){
   const raw = await ocrRect(ROI.set, oriDeg, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ•★* -', miniSet);
   rawSetEl.textContent = raw || '—';
   const m = raw.match(/\b([A-Z]{2,5})\s*[•★\-\.\· ]\s*([A-Z]{2})\b/);
-  if(!m) return null;
-  return { set:m[1].toUpperCase(), lang:m[2].toUpperCase() };
+  if(!m) return null; return { set:m[1].toUpperCase(), lang:m[2].toUpperCase() };
 }
 async function readCode(oriDeg){
   const raw = await ocrRect(ROI.code, oriDeg, '0123456789/ CMURcmurSTabAB', miniCode);
   rawCodeEl.textContent = raw || '—';
   let m = raw.match(/(\d{1,4})\s*\/\s*(\d{2,4})\s*([A-Za-z])?/); // 039/302 C
-  if(m){
-    const num = String(+m[1]) + (/[a-z]$/i.test(m[1]) ? m[1].slice(-1).toLowerCase() : '');
-    const rarity = (m[3]||'').toUpperCase();
-    return { human:`${m[1]}/${m[2]} ${rarity||''}`.trim(), key:`A|${num}|${rarity}`, number:num, rarity };
-  }
+  if(m){ const num=String(+m[1]) + (/[a-z]$/i.test(m[1])?m[1].slice(-1).toLowerCase():''); const rarity=(m[3]||'').toUpperCase(); return { human:`${m[1]}/${m[2]} ${rarity||''}`.trim(), key:`A|${num}|${rarity}`, number:num, rarity }; }
   m = raw.match(/\b([RCUMST])\s*0*([0-9]{1,4}[a-z]?)\b/i); // R 0006, C 12, 006a
-  if(m){
-    const rarity = (m[1]||'').toUpperCase();
-    const num = m[2].toLowerCase();
-    return { human:`${rarity?rarity+' ':''}${num}`, key:`B|${num}|${rarity}`, number:num, rarity };
-  }
+  if(m){ const rarity=(m[1]||'').toUpperCase(); const num=m[2].toLowerCase(); return { human:`${rarity?rarity+' ':''}${num}`, key:`B|${num}|${rarity}`, number:num, rarity }; }
   return null;
 }
 
-/* ===== Loop ===== */
+/* Loop */
 function schedule(){ if(!running) return; const ms=Math.max(250,Number(intervalIn.value)*1000); timer=setTimeout(tick,ms); }
 async function tick(){
-  if(!running || paused || scanning || !workerReady){ schedule(); return; }
+  if(!running || paused || scanning){ schedule(); return; }
   scanning=true;
   try{
-    drawOverlay(debug ? 'escanejant' : '');
-    const oris=[0,180,90,270];
-    let foundSet=null, bestOri=0;
-    for(const o of oris){
-      if(debug) drawOverlay('ori '+o+'°');
-      const s=await readSet(o);
-      if(s){ foundSet=s; bestOri=o; break; }
-    }
+    drawOverlay(debug?'escanejant':'');
+    const oris=[0,180,90,270]; let foundSet=null, bestOri=0;
+    for(const o of oris){ if(debug) drawOverlay('ori '+o+'°'); const s=await readSet(o); if(s){ foundSet=s; bestOri=o; break; } }
     const code=await readCode(bestOri);
     if(foundSet) lastSet.textContent = `${foundSet.set} • ${foundSet.lang}`;
     if(!code){ status('Sense codi…'); scanning=false; schedule(); return; }
@@ -286,9 +245,8 @@ async function tick(){
     // validació doble
     const now=performance.now(); buffer.push({code,t:now}); if(buffer.length>2) buffer.shift();
     const ok = buffer.length===2 && buffer[0].code.key===buffer[1].code.key && (buffer[1].t-buffer[0].t)<1500;
-    if(!ok){ status('Detectat (esperant confirmació)…'); scanning=false; schedule(); return; }
+    if(!ok){ status('Detectat (confirmant)…'); scanning=false; schedule(); return; }
 
-    // cooldown
     if(seenKeys.has(code.key) && now<cooldownUntil){ scanning=false; schedule(); return; }
     cooldownUntil=now+2000; seenKeys.add(code.key);
 
@@ -299,126 +257,76 @@ async function tick(){
   finally{ scanning=false; schedule(); }
 }
 
-/* ===== Scryfall ===== */
+/* Scryfall */
 async function fetchBySetAndNumber(set, number, lang){
   try{
     const langPart = (lang && lang.toLowerCase()==='sp') ? '/es' : '';
     const url = `https://api.scryfall.com/cards/${set.toLowerCase()}/${encodeURIComponent(number)}${langPart}`;
-    const r = await fetch(url);
-    if(r.ok){ const j=await r.json(); return [j]; }
+    const r = await fetch(url); if(r.ok){ const j=await r.json(); return [j]; }
   }catch(e){}
   return [];
 }
-async function scry(url){
-  try{ const r=await fetch(url); const j=await r.json(); return j.data||[]; }catch(e){ return []; }
-}
+async function scry(url){ try{ const r=await fetch(url); const j=await r.json(); return j.data||[]; }catch(e){ return []; } }
 async function lookupPrice({code, setInfo, preferEs}){
-  let data=[];
-  if(setInfo?.set){ data = await fetchBySetAndNumber(setInfo.set, code.number, setInfo.lang); }
+  let data=[]; if(setInfo?.set){ data = await fetchBySetAndNumber(setInfo.set, code.number, setInfo.lang); }
   if(!data.length){
     let q = `number:${code.number}` + (setInfo?.set?` set:${setInfo.set.toLowerCase()}`:'') + (preferEs?' lang:es':'') + (code.rarity?` rarity:${code.rarity.toLowerCase()}`:'');
     const url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&unique=prints&include_extras=false&order=eur&dir=desc`;
     data = await scry(url);
   }
   if(!data.length) return {ok:false, why:'Sense resultats.'};
-
-  const items = data.map(c=>{
-    const p=c.prices||{}; const eur=+(p.eur||p.eur_foil||0); const usd=+(p.usd||p.usd_foil||p.usd_etched||0);
-    return {card:c, eur, usd, best:(eur||usd||0)};
-  }).sort((a,b)=>b.best-a.best);
+  const items = data.map(c=>{ const p=c.prices||{}; const eur=+(p.eur||p.eur_foil||0); const usd=+(p.usd||p.usd_foil||p.usd_etched||0); return {card:c, eur, usd, best:(eur||usd||0)}; }).sort((a,b)=>b.best-a.best);
   const b=items[0];
-  return {
-    ok:true,
-    name:b.card.name, set:b.card.set.toUpperCase(), lang:b.card.lang.toUpperCase(),
-    number:b.card.collector_number, rarity:b.card.rarity, eur:b.eur||null, usd:b.usd||null,
-    link:b.card.scryfall_uri||b.card.uri,
-    query:`set:${setInfo?.set||'?'} number:${code.number}${preferEs?' lang:es':''}${code.rarity?' rarity:'+code.rarity.toLowerCase():''}`
-  };
+  return { ok:true, name:b.card.name, set:b.card.set.toUpperCase(), lang:b.card.lang.toUpperCase(), number:b.card.collector_number, rarity:b.card.rarity, eur:b.eur||null, usd:b.usd||null, link:b.card.scryfall_uri||b.card.uri };
 }
 
-/* ===== UI ===== */
+/* UI & so */
 function renderPrice(res){
   if(!res.ok){ lastPrice.textContent='—'; explain.textContent=res.why||'—'; return; }
   lastSet.textContent = `${res.set} • ${res.lang}`;
   lastPrice.innerHTML = `${res.eur?res.eur.toFixed(2)+' €':'—'} <span class="muted">(USD ${res.usd?res.usd.toFixed(2):'—'})</span>`;
-  explain.innerHTML = `${res.name} · #${res.number} · ${res.rarity} · <a href="${res.link}" target="_blank" rel="noopener">Scryfall</a><br><span class="muted">consulta: <code>${res.query}</code></span>`;
-
+  explain.innerHTML = `${res.name} · #${res.number} · ${res.rarity} · <a href="${res.link}" target="_blank" rel="noopener">Scryfall</a>`;
   const row=document.createElement('div'); row.className='item';
   row.innerHTML = `<div><b>${res.name}</b> (${res.set}) · #${res.number} · ${res.lang}</div>
-  <div>Preu: <b>${res.eur?res.eur.toFixed(2)+' €':'—'}</b> <span class="muted">(USD ${res.usd?res.usd.toFixed(2):'—'})</span></div>`;
+                   <div>Preu: <b>${res.eur?res.eur.toFixed(2)+' €':'—'}</b> <span class="muted">(USD ${res.usd?res.usd.toFixed(2):'—'})</span></div>`;
   listEl.prepend(row);
-
   const thr=Number(thresholdIn.value)||0; if((res.eur||res.usd||0)>=thr) beep();
 }
-function beep(){
-  if(!beepChk.checked) return;
-  const ctx = new (window.AudioContext||window.webkitAudioContext)();
-  const o = ctx.createOscillator(); const g = ctx.createGain();
-  o.frequency.value=920; o.connect(g); g.connect(ctx.destination);
-  g.gain.setValueAtTime(0.0001, ctx.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.45, ctx.currentTime+0.01);
-  g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime+0.25);
-  o.start(); o.stop(ctx.currentTime+0.26);
-}
+function beep(){ if(!beepChk.checked) return; const ctx=new (window.AudioContext||window.webkitAudioContext)(); const o=ctx.createOscillator(); const g=ctx.createGain(); o.frequency.value=920; o.connect(g); g.connect(ctx.destination); g.gain.setValueAtTime(0.0001, ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.45, ctx.currentTime+0.01); g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime+0.25); o.start(); o.stop(ctx.currentTime+0.26); }
 
-/* ===== Touch & controls ===== */
-startBtn.onclick = async()=>{ if(!workerReady) await setupWorker(); await startCam(); };
+/* Controls */
+startBtn.onclick = async ()=>{ await startCam(); /* OCR s’inicialitza en paral·lel */ };
 stopBtn.onclick = stopCam;
-flipBtn.onclick = async()=>{ facing = (facing==='environment'?'user':'environment'); stopCam(); await sleep(150); startCam(); };
+flipBtn.onclick = async()=>{ facing=(facing==='environment'?'user':'environment'); stopCam(); await sleep(150); startCam(); };
 zoomInput.oninput = e=>applyZoom(Number(e.target.value));
 pauseChk.onchange = e=>{ paused=e.target.checked; };
-debugChk.onchange = e=>{ debug=e.target.checked; drawOverlay(debug?'debug':'' ); };
-editRoiBtn.onclick = ()=>{
-  editing = !editing; if(editing){ stage.classList.add('editing'); } else { stage.classList.remove('editing'); }
-  editTarget = (editTarget==='code'?'set':'code'); roiWhich.textContent = editTarget==='code'?'Codi':'Set';
-};
+debugChk.onchange = e=>{ debug=e.target.checked; drawOverlay(debug?'debug':''); };
 
-/* tap pausa / doble-tap debug */
-let lastTap=0;
-stage.addEventListener('click', e=>{
-  const now=Date.now();
-  if(now-lastTap<300){ debugChk.checked=!debugChk.checked; debug=!debug; drawOverlay(debug?'debug':''); }
-  else { paused=!paused; pauseChk.checked=paused; }
-  lastTap=now;
-});
-/* pinch zoom */
-stage.addEventListener('touchstart', e=>{
-  if(e.touches.length===2){ const dx=e.touches[0].clientX-e.touches[1].clientX; const dy=e.touches[0].clientY-e.touches[1].clientY; pinchRefDist=Math.hypot(dx,dy); }
-}, {passive:true});
-stage.addEventListener('touchmove', e=>{
-  if(pinchRefDist && e.touches.length===2){
-    const dx=e.touches[0].clientX-e.touches[1].clientX; const dy=e.touches[0].clientY-e.touches[1].clientY;
-    const d=Math.hypot(dx,dy); const cur=Number(zoomInput.value||1); applyZoom(cur*(d/pinchRefDist)); pinchRefDist=d;
-  }
-}, {passive:false});
+let lastTap=0; stage.addEventListener('click', e=>{ const now=Date.now(); if(now-lastTap<300){ debugChk.checked=!debugChk.checked; debug=!debug; drawOverlay(debug?'debug':''); } else { paused=!paused; pauseChk.checked=paused; } lastTap=now; });
+
+let pinchRefDist=null;
+stage.addEventListener('touchstart', e=>{ if(e.touches.length===2){ const dx=e.touches[0].clientX-e.touches[1].clientX; const dy=e.touches[0].clientY-e.touches[1].clientY; pinchRefDist=Math.hypot(dx,dy);} },{passive:true});
+stage.addEventListener('touchmove', e=>{ if(pinchRefDist && e.touches.length===2){ const dx=e.touches[0].clientX-e.touches[1].clientX; const dy=e.touches[0].clientY-e.touches[1].clientY; const d=Math.hypot(dx,dy); const cur=Number(zoomInput.value||1); applyZoom(cur*(d/pinchRefDist)); pinchRefDist=d; } },{passive:false});
 stage.addEventListener('touchend', ()=>{ pinchRefDist=null; });
 
-/* Editar ROI: arrossegar rectangle seleccionat */
-let drag=null;
+/* Edició ROI per tocar/arrelar */
+const roiBtn = document.getElementById('editRoi'); const roiWhich = document.getElementById('roiWhich');
+let editing=false, drag=null;
+editRoiBtn.onclick = ()=>{ editing=!editing; if(editing){ editTarget = (editTarget==='code'?'set':'code'); roiWhich.textContent = editTarget==='code'?'Codi':'Set'; } };
 ovl.addEventListener('touchstart', e=>{
-  if(!editing) return;
-  const t=e.touches[0]; const r=ovl.getBoundingClientRect();
-  const x=(t.clientX-r.left)/r.width, y=(t.clientY-r.top)/r.height;
-  drag = {start:{x,y}, base:{...ROI[editTarget]}};
+  if(!editing) return; const t=e.touches[0]; const r=ovl.getBoundingClientRect(); const x=(t.clientX-r.left)/r.width, y=(t.clientY-r.top)/r.height; drag={start:{x,y}, base:{...ROI[editTarget]}};
 },{passive:true});
 ovl.addEventListener('touchmove', e=>{
-  if(!editing || !drag) return;
-  const t=e.touches[0]; const r=ovl.getBoundingClientRect();
-  const x=(t.clientX-r.left)/r.width, y=(t.clientY-r.top)/r.height;
-  const dx=x-drag.start.x, dy=y-drag.start.y;
-  ROI[editTarget].x = Math.max(0, Math.min(1-ROI[editTarget].w, drag.base.x+dx));
-  ROI[editTarget].y = Math.max(0, Math.min(1-ROI[editTarget].h, drag.base.y+dy));
-  drawOverlay('edit');
+  if(!editing||!drag) return; const t=e.touches[0]; const r=ovl.getBoundingClientRect(); const x=(t.clientX-r.left)/r.width, y=(t.clientY-r.top)/r.height; const dx=x-drag.start.x, dy=y-drag.start.y;
+  ROI[editTarget].x=Math.max(0,Math.min(1-ROI[editTarget].w, drag.base.x+dx));
+  ROI[editTarget].y=Math.max(0,Math.min(1-ROI[editTarget].h, drag.base.y+dy)); drawOverlay('edit');
 },{passive:false});
 ovl.addEventListener('touchend', ()=>{ drag=null; });
 
-/* ===== kick things ===== */
+/* Scheduler + overlay inicial */
+new ResizeObserver(()=>drawOverlay()).observe(stage);
+function schedule(){ if(!running) return; const ms=Math.max(250,Number(intervalIn.value)*1000); timer=setTimeout(tick,ms); }
 drawOverlay('esperant');
-
-/* ===== loop scheduler ===== */
-(function loopScheduler(){
-  new ResizeObserver(()=>drawOverlay(debug?'debug':'' )).observe(stage);
-})();
 </script>
 </body>
 </html>
