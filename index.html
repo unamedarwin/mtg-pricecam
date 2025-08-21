@@ -3,54 +3,57 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MTG Scanner – OCR codi inferior esquerra + preu</title>
+<title>MTG PriceCam – OCR automàtic (inferior esquerra + set)</title>
 <style>
   :root{font-family:system-ui,Arial,sans-serif}
   body{margin:18px}
-  h1{font-size:1.15rem;margin:0 0 10px}
-  .grid{display:grid;grid-template-columns:360px 1fr;gap:16px;align-items:start}
-  video,canvas{width:100%;max-width:100%;background:#111;border-radius:8px}
-  .panel{border:1px solid #e5e5e5;border-radius:10px;padding:12px;background:#fafafa}
+  h1{font-size:1.1rem;margin:0 0 10px}
+  .grid{display:grid;grid-template-columns:380px 1fr;gap:16px;align-items:start}
+  .stage{position:relative}
+  video{width:100%;border-radius:10px;background:#000}
+  canvas.overlay{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+  .panel{border:1px solid #e6e6e6;border-radius:10px;padding:12px;background:#fafafa}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-  .btn{padding:8px 12px;border:1px solid #888;background:white;cursor:pointer;border-radius:8px}
-  .ok{color:#0a7b25}
-  .warn{color:#b35a00}
-  .bad{color:#b00020}
+  .btn{padding:8px 12px;border:1px solid #888;border-radius:8px;background:white;cursor:pointer}
+  .pill{padding:.2rem .5rem;border:1px solid #bbb;border-radius:999px;background:#fff}
+  #status{min-height:24px;color:#555}
+  .big{font-size:1.35rem}
   .item{border-top:1px dashed #ddd;padding:8px 0}
-  .big{font-size:1.25rem}
-  .pill{display:inline-block;padding:.15rem .45rem;border:1px solid #ddd;border-radius:999px;background:#fff;margin-left:.4rem}
-  #status{min-height:24px}
-  code{background:#f3f3f3;padding:.1rem .25rem;border-radius:4px}
+  code{background:#f4f4f4;padding:.1rem .25rem;border-radius:4px}
 </style>
 </head>
 <body>
-<h1>Escaneig automàtic del codi (inferior esquerra) + consulta de preus</h1>
+<h1>Escaneig automàtic del codi + set (i preus Scryfall)</h1>
 
 <div class="grid">
   <div>
-    <video id="video" autoplay playsinline muted></video>
+    <div class="stage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="ovl" class="overlay"></canvas>
+    </div>
     <div class="panel" style="margin-top:10px">
       <div class="row">
         <button id="start" class="btn">Inicia càmera</button>
         <button id="stop" class="btn">Atura</button>
-        <label>Freq. (s): <input id="interval" type="number" min="0.5" step="0.1" value="1.2" class="pill"></label>
+        <label>Freq. (s): <input id="interval" type="number" min="0.4" step="0.1" value="1.0" class="pill"></label>
         <label>Llindar alerta (€): <input id="threshold" type="number" step="0.5" value="15" class="pill"></label>
-        <label><input id="beep" type="checkbox" checked> so si supera llindar</label>
-        <label><input id="strictEs" type="checkbox" checked> preferir cartes en espanyol</label>
+        <label><input id="beep" type="checkbox" checked> so</label>
+        <label><input id="preferEs" type="checkbox" checked> preferir ES</label>
       </div>
-      <div id="status" class="small"></div>
+      <div id="status"></div>
     </div>
-    <canvas id="work" width="640" height="480" hidden></canvas>
+    <!-- canvasses de treball ocults -->
+    <canvas id="work" width="1280" height="960" hidden></canvas>
     <canvas id="roi" hidden></canvas>
   </div>
 
   <div>
     <div class="panel">
-      <div><b>Últim codi:</b> <span id="lastCode">—</span></div>
-      <div style="margin-top:6px"><b>Preu estimat:</b> <span id="lastPrice" class="big">—</span></div>
+      <div><b>Codi detectat:</b> <span id="lastCode">—</span></div>
+      <div><b>Set/Idioma:</b> <span id="lastSet">—</span></div>
+      <div style="margin-top:6px"><b>Preu:</b> <span id="lastPrice" class="big">—</span></div>
       <div id="explain" class="small" style="margin-top:6px;color:#555"></div>
     </div>
-
     <div class="panel" style="margin-top:10px">
       <div><b>Historial</b></div>
       <div id="list"></div>
@@ -58,231 +61,271 @@
   </div>
 </div>
 
-<!-- Tesseract (OCR) -->
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
 <script>
+/* ---------- Elements ---------- */
 const video = document.getElementById('video');
+const ovl   = document.getElementById('ovl');
+const octx  = ovl.getContext('2d');
 const work  = document.getElementById('work');
-const wctx  = work.getContext('2d');
+const wctx  = work.getContext('2d', { willReadFrequently:true });
 const roiC  = document.getElementById('roi');
-const rctx  = roiC.getContext('2d');
+const rctx  = roiC.getContext('2d', { willReadFrequently:true });
 
 const startBtn = document.getElementById('start');
 const stopBtn  = document.getElementById('stop');
 const statusEl = document.getElementById('status');
 const lastCode = document.getElementById('lastCode');
+const lastSet  = document.getElementById('lastSet');
 const lastPrice= document.getElementById('lastPrice');
-const listEl   = document.getElementById('list');
 const explain  = document.getElementById('explain');
+const listEl   = document.getElementById('list');
 const intervalIn = document.getElementById('interval');
 const thresholdIn= document.getElementById('threshold');
 const beepChk  = document.getElementById('beep');
-const strictEs = document.getElementById('strictEs');
+const preferEs = document.getElementById('preferEs');
 
-let stream=null, timer=null, running=false, scanning=false;
-let seen = new Set(); // evita reconsultar el mateix codi seguit
+/* ---------- Estat ---------- */
+let stream=null, running=false, timer=null, scanning=false;
+let cooldownUntil = 0;
+let lastHit = {code:null,set:null,when:0};
+let buffer = []; // darrers dos codis
+let seenKeys = new Set();
 
-// ROI candidates (x,y,w,h en percentatge del frame)
-const CANDS = [
-  // inferiors esquerres (carta dreta)
-  {x:.03,y:.80,w:.46,h:.15},
-  {x:.05,y:.78,w:.50,h:.16},
-  {x:.02,y:.82,w:.40,h:.14},
-  {x:.06,y:.83,w:.42,h:.14},
-];
-// també el cas girat 180° (top-right equivalent)
-function rotated(c){ return { x:1-(c.x+c.w), y:1-(c.y+c.h), w:c.w, h:c.h }; }
-const ALL_CANDS = [...CANDS, ...CANDS.map(rotated)];
+/* ---------- OCR worker (PSM 7) ---------- */
+const worker = Tesseract.createWorker({ logger: m=>{} });
+let workerReady=false;
+(async ()=>{
+  await worker.load();
+  await worker.loadLanguage('eng');
+  await worker.initialize('eng');
+  await worker.setParameters({ tessedit_pageseg_mode: 7 });
+  workerReady=true;
+  status('OCR llest.');
+})();
 
-async function startCam(){
+/* ---------- Controls ---------- */
+startBtn.onclick = async ()=>{
   try{
-    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode:'environment', width:{ideal:1280}, height:{ideal:960}, aspectRatio:{ideal:4/3} }
+    });
     video.srcObject = stream;
     running = true;
-    schedule();
-    status('Càmera en marxa. Passa cartes davant del visor.');
-  }catch(e){
-    status('No s’ha pogut obrir la càmera: '+e.message, 'bad');
-  }
-}
-function stopCam(){
-  running=false;
-  if(timer){ clearTimeout(timer); timer=null; }
-  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
-  status('Aturat.');
-}
-startBtn.onclick = startCam;
-stopBtn.onclick  = stopCam;
+    ovl.width  = video.clientWidth  || 640;
+    ovl.height = video.clientHeight || 480;
+    schedule(); status('Càmera en marxa.');
+  }catch(e){ status('No s’ha pogut obrir la càmera: '+e.message, 'bad'); }
+};
+stopBtn.onclick = ()=>{ running=false; if(timer) clearTimeout(timer); if(stream){ stream.getTracks().forEach(t=>t.stop()); } status('Aturat.'); };
 
-function schedule(){
-  if(!running) return;
-  const ms = Math.max(300, Number(intervalIn.value)*1000);
-  timer = setTimeout(tick, ms);
+/* ---------- ROIs en percentatges ---------- */
+// (A) Codi inferior esquerra
+const ROI_CODE   = {x:.03, y:.84, w:.44, h:.12};
+// (B) SET • LANG al centre inferior
+const ROI_SET    = {x:.35, y:.91, w:.30, h:.06};
+function rotateRect(r, deg){
+  // per 90/270 pivotant el frame
+  if(deg%180===0) return r;
+  return { x: 1 - (r.y + r.h), y: r.x, w: r.h, h: r.w }; // rotació 90º CW
+}
+/* ---------- Dibuix overlay ---------- */
+function drawOverlay(rects=[]){
+  const W = ovl.width, H = ovl.height;
+  octx.clearRect(0,0,W,H);
+  octx.lineWidth = 3; octx.strokeStyle = 'rgba(50,200,90,.9)';
+  rects.forEach(r=>{
+    octx.strokeRect(r.x*W, r.y*H, r.w*W, r.h*H);
+  });
 }
 
+/* ---------- Cicle ---------- */
+function schedule(){ if(!running) return; timer=setTimeout(tick, Math.max(250, Number(intervalIn.value)*1000)); }
 async function tick(){
-  if(!running) return;
-  if(scanning){ schedule(); return; }
+  if(!running || scanning || !workerReady){ schedule(); return; }
   scanning=true;
   try{
-    // Captura frame
     const vw = video.videoWidth, vh = video.videoHeight;
     if(!vw || !vh){ scanning=false; schedule(); return; }
-    work.width = vw; work.height = vh;
-    wctx.drawImage(video,0,0,vw,vh);
+    work.width=vw; work.height=vh; wctx.drawImage(video,0,0,vw,vh);
+    drawOverlay([ROI_CODE, ROI_SET]);
 
-    // prova candidates
-    for(const c of ALL_CANDS){
-      const ok = await tryCandidate(c);
-      if(ok) break; // si ja hem trobat codi vàlid, parem aquesta volta
+    // prova orientacions: 0,180,90,270. Triem la primera que doni SET vàlid; sinó igualment provem codi.
+    const orientations = [0,180,90,270];
+    let bestOri = 0, setInfo = null;
+    for(const ori of orientations){
+      const s = await readSet(ori);
+      if(s){ bestOri = ori; setInfo = s; break; }
     }
-  }catch(e){
-    console.error(e);
-  }finally{
-    scanning=false;
-    schedule();
-  }
+    const code = await readCode(bestOri);
+    if(setInfo) lastSet.textContent = `${setInfo.set} • ${setInfo.lang}`;
+    if(!code) { status('Sense codi…'); scanning=false; schedule(); return; }
+
+    // validació doble (mateix codi 2 cops seguits en <1.5s)
+    const now = performance.now();
+    buffer.push({code, t:now});
+    if(buffer.length>2) buffer.shift();
+    const ok = buffer.length===2 && buffer[0].code.key===buffer[1].code.key && (buffer[1].t-buffer[0].t)<1500;
+
+    if(!ok){ status(`Codi detectat (pendent validació): ${code.human}`); scanning=false; schedule(); return; }
+
+    // evita repeticions + cooldown 2s
+    if(seenKeys.has(code.key) && now<cooldownUntil){ scanning=false; schedule(); return; }
+    cooldownUntil = now + 2000; seenKeys.add(code.key);
+
+    lastCode.textContent = code.human;
+
+    // consulta preu
+    const res = await lookupPrice({ code, setInfo, preferEs: preferEs.checked });
+    renderPrice(res);
+  }catch(e){ console.error(e); }
+  finally{ scanning=false; schedule(); }
 }
 
-async function tryCandidate(c){
-  const {width:vw, height:vh} = work;
-  const sx = Math.max(0, Math.floor(vw*c.x));
-  const sy = Math.max(0, Math.floor(vh*c.y));
-  const sw = Math.floor(vw*c.w);
-  const sh = Math.floor(vh*c.h);
+/* ---------- OCR helpers ---------- */
+async function ocrRect(rect, deg, whitelist){
+  const {width:vw,height:vh} = work;
+  // agafa ROI segons orientació
+  let r = rect;
+  if(deg===90)  r = rotateRect(rect,90);
+  if(deg===180) r = { x:1-(rect.x+rect.w), y:1-(rect.y+rect.h), w:rect.w, h:rect.h };
+  if(deg===270) r = rotateRect(rotateRect(rect,90),90);
 
-  // retall + preprocess (B/N amb contrast)
-  roiC.width = sw; roiC.height = sh;
-  rctx.drawImage(work, sx, sy, sw, sh, 0, 0, sw, sh);
-  const img = rctx.getImageData(0,0,sw,sh);
-  const d = img.data;
+  const sx = Math.max(0, (r.x*vw)|0);
+  const sy = Math.max(0, (r.y*vh)|0);
+  const sw = Math.max(2, (r.w*vw)|0);
+  const sh = Math.max(2, (r.h*vh)|0);
+
+  // retalla + preprocess (escala 2x, gris, contrast, binarització)
+  roiC.width = sw*2; roiC.height = sh*2;
+  rctx.imageSmoothingEnabled = false;
+  rctx.drawImage(work, sx, sy, sw, sh, 0, 0, sw*2, sh*2);
+  const im = rctx.getImageData(0,0,roiC.width, roiC.height);
+  const d = im.data;
   for(let i=0;i<d.length;i+=4){
-    // luminància + augment de contrast
     let y = 0.2126*d[i] + 0.7152*d[i+1] + 0.0722*d[i+2];
-    y = (y-128)*1.6 + 128;
-    y = y<110 ? 0 : y>160 ? 255 : y; // binarització suau a la franja de text
-    d[i]=d[i+1]=d[i+2]=y; d[i+3]=255;
+    y = (y-128)*1.8 + 128; // contrast
+    const t = 140;         // llindar simple
+    const v = y<t ? 0 : 255;
+    d[i]=d[i+1]=d[i+2]=v; d[i+3]=255;
   }
-  rctx.putImageData(img,0,0);
+  rctx.putImageData(im,0,0);
 
   // OCR
-  const { data } = await Tesseract.recognize(roiC, 'eng', { tessedit_char_whitelist:'0123456789/ CMURcmur' });
+  await worker.setParameters({ tessedit_char_whitelist: whitelist || '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/• .-' });
+  const { data } = await worker.recognize(roiC);
   const raw = (data.text||'').replace(/\s+/g,' ').trim();
-
-  // patró com 039/302 C
-  const m = raw.match(/(\d{1,3})\s*\/\s*(\d{1,3})\s*([A-Za-z])?/);
-  if(!m) { status('Sense codi…'); return false; }
-
-  const number = String(+m[1]);
-  const total  = String(+m[2]);
-  const rarity = (m[3]||'').toUpperCase();
-
-  const key = number+'|'+rarity;
-  if(seen.has(key)) { status(`Codi detectat ${number}/${total} ${rarity} (ja consultat).`); return true; }
-  seen.add(key);
-
-  lastCode.textContent = `${m[1]}/${m[2]} ${rarity||''}`.trim();
-  explain.textContent = 'Cerca a Scryfall per número (i llengua/raresa si es pot).';
-
-  const price = await lookupPrice({number, rarity, preferEs: strictEs.checked});
-  renderPrice(price);
-  return true;
+  return raw;
 }
 
-async function lookupPrice({number, rarity, preferEs}){
-  // construeix query relativament estricta; si no hi ha èxit, relaxa
-  let q = `number:${number}` + (rarity?` rarity:${rarity.toLowerCase()}`:'');
-  if(preferEs) q += ' lang:es';
+function normDigits(s){
+  return s.replace(/[Oo]/g,'0')
+          .replace(/[Iíl]/gi,'1')
+          .replace(/S/g,'5')
+          .replace(/B/g,'8')
+          .replace(/[—–]/g,'-')
+          .trim();
+}
 
-  let data = await scry(q);
-  if(!data.length && preferEs) {
-    // relaxa a qualsevol idioma
-    data = await scry(`number:${number}` + (rarity?` rarity:${rarity.toLowerCase()}`:''));
+async function readSet(oriDeg){
+  const raw = normDigits(await ocrRect(ROI_SET, oriDeg, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ• -'));
+  // patrons: "BLB • SP" | "BLB SP" | "BLB-ES"
+  const m = raw.match(/\b([A-Z]{2,5})\s*[•\-\.\· ]\s*([A-Z]{2})\b/);
+  if(!m) return null;
+  return { set:m[1].toUpperCase(), lang:m[2].toUpperCase() };
+}
+
+async function readCode(oriDeg){
+  const raw = normDigits(await ocrRect(ROI_CODE, oriDeg, '0123456789/ CMURcmurabAB'));
+  // A) 039/302 C  (o sense lletra)
+  let m = raw.match(/(\d{1,3})\s*\/\s*(\d{2,3})\s*([A-Za-z])?/);
+  if(m){
+    const num = String(+m[1]) + (/[a-z]$/i.test(m[1]) ? m[1].slice(-1).toLowerCase() : '');
+    const rarity = (m[3]||'').toUpperCase();
+    return { human:`${m[1]}/${m[2]} ${rarity||''}`.trim(), key:`A|${num}|${rarity}`, number:num, rarity };
   }
+  // B) R 0006 | C 12 | 006a
+  m = raw.match(/\b([RCUM])?\s*0*([0-9]{1,4}[a-z]?)\b/i);
+  if(m){
+    const rarity = (m[1]||'').toUpperCase();
+    const num = m[2].toLowerCase();
+    return { human:`${rarity?rarity+' ':''}${num}`, key:`B|${num}|${rarity}`, number:num, rarity };
+  }
+  return null;
+}
 
-  if(!data.length) return {ok:false, why:'Sense coincidències a Scryfall.'};
+/* ---------- Scryfall ---------- */
+async function lookupPrice({code, setInfo, preferEs}){
+  let q = `number:${code.number}`;
+  if(code.rarity) q += ` rarity:${code.rarity.toLowerCase()}`;
+  if(setInfo && setInfo.set) q += ` set:${setInfo.set.toLowerCase()}`;
+  if(preferEs) q += ' lang:es';
+  // consulta ordenada per EUR desc
+  let url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}&unique=prints&include_extras=false&order=eur&dir=desc`;
+  let data = await scry(url);
+  if((!data || !data.length) && preferEs){
+    // relaxa idioma
+    url = `https://api.scryfall.com/cards/search?q=${encodeURIComponent(q.replace(' lang:es',''))}&unique=prints&include_extras=false&order=eur&dir=desc`;
+    data = await scry(url);
+  }
+  if(!data || !data.length) return {ok:false, why:'Sense coincidències a Scryfall per '+q};
 
-  // escull la millor coincidència: amb preu definit i més alt
   const items = data.map(c=>{
-    const p = c.prices||{};
-    const usd = +(p.usd||p.usd_foil||p.usd_etched||0);
-    const eur = +(p.eur||p.eur_foil||0);
-    const best = eur || usd || 0;
-    return {card:c, usd, eur, best};
+    const p=c.prices||{};
+    const eur=+(p.eur||p.eur_foil||0);
+    const usd=+(p.usd||p.usd_foil||p.usd_etched||0);
+    const best= eur || usd || 0;
+    return {card:c,eur,usd,best};
   }).sort((a,b)=>b.best-a.best);
 
-  const best = items[0];
+  const b=items[0];
   return {
     ok:true,
-    name: best.card.name,
-    set:  best.card.set.toUpperCase(),
-    lang: best.card.lang.toUpperCase(),
-    number: best.card.collector_number,
-    rarity: best.card.rarity,
-    usd: best.usd || null,
-    eur: best.eur || null,
-    link: best.card.scryfall_uri || best.card.uri
+    name:b.card.name,
+    set:b.card.set.toUpperCase(),
+    lang:b.card.lang.toUpperCase(),
+    number:b.card.collector_number,
+    rarity:b.card.rarity,
+    eur: b.eur || null,
+    usd: b.usd || null,
+    link:b.card.scryfall_uri || b.card.uri,
+    query:q
   };
 }
 
-async function scry(q){
+async function scry(url){
   try{
-    const res = await fetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}`);
+    const res = await fetch(url);
     const json = await res.json();
     return json.data || [];
-  }catch(e){
-    status('Error Scryfall: '+e.message,'bad');
-    return [];
-  }
+  }catch(e){ status('Error Scryfall: '+e.message); return []; }
 }
 
+/* ---------- UI / so ---------- */
 function renderPrice(res){
-  if(!res.ok){
-    lastPrice.textContent = '—';
-    explain.textContent = res.why||'—';
-    return;
-  }
-  const eur = res.eur ? res.eur.toFixed(2)+' €' : '—';
-  const usd = res.usd ? '$'+res.usd.toFixed(2) : '—';
-  lastPrice.innerHTML = `${eur} <span class="small">(USD ${usd})</span>`;
-  explain.innerHTML = `${res.name} (${res.set}) · #${res.number} · ${res.lang} · ${res.rarity} · <a href="${res.link}" target="_blank" rel="noopener">Scryfall</a>`;
+  if(!res.ok){ lastPrice.textContent='—'; explain.textContent=res.why||'—'; return; }
+  lastSet.textContent = `${res.set} • ${res.lang}`;
+  lastPrice.innerHTML = `${res.eur ? res.eur.toFixed(2)+' €' : '—'} <span class="small">(USD ${res.usd?res.usd.toFixed(2):'—'})</span>`;
+  explain.innerHTML = `${res.name} · #${res.number} · ${res.rarity} · <a href="${res.link}" target="_blank" rel="noopener">Scryfall</a><br><span class="small">consulta: <code>${res.query}</code></span>`;
 
-  const row = document.createElement('div');
-  row.className = 'item';
-  row.innerHTML =
-    `<div><b>${res.name}</b> (${res.set}) · #${res.number} · ${res.lang}</div>
-     <div>Preu: <b>${eur}</b> <span class="small">(USD ${usd})</span></div>`;
+  const row=document.createElement('div'); row.className='item';
+  row.innerHTML = `<div><b>${res.name}</b> (${res.set}) · #${res.number} · ${res.lang}</div>
+                   <div>Preu: <b>${res.eur?res.eur.toFixed(2)+' €':'—'}</b> <span class="small">(USD ${res.usd?res.usd.toFixed(2):'—'})</span></div>`;
   listEl.prepend(row);
 
   const thr = Number(thresholdIn.value)||0;
-  if((res.eur||res.usd||0) >= thr){
-    lastPrice.classList.add('ok');
-    alertBeep();
-    status(`Valor ≥ ${thr}€`, 'ok');
-  }else{
-    lastPrice.classList.remove('ok');
-    status('Detectat i valorat.');
-  }
+  if((res.eur||res.usd||0) >= thr) beep();
 }
-
-function status(msg, cls){
-  statusEl.className = cls||'';
-  statusEl.textContent = msg||'';
-}
-
-// beep curt
-function alertBeep(){
+function status(msg){ statusEl.textContent = msg||''; }
+function beep(){
   if(!beepChk.checked) return;
-  try{
-    const ctx = new (window.AudioContext||window.webkitAudioContext)();
-    const o = ctx.createOscillator(); const g = ctx.createGain();
-    o.type='sine'; o.frequency.value=880;
-    o.connect(g); g.connect(ctx.destination);
-    g.gain.setValueAtTime(0.0001, ctx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.4, ctx.currentTime+0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime+0.25);
-    o.start(); o.stop(ctx.currentTime+0.26);
-  }catch(e){}
+  const ctx = new (window.AudioContext||window.webkitAudioContext)();
+  const o = ctx.createOscillator(); const g = ctx.createGain();
+  o.frequency.value=900; o.connect(g); g.connect(ctx.destination);
+  g.gain.setValueAtTime(0.0001, ctx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.4, ctx.currentTime+0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime+0.25);
+  o.start(); o.stop(ctx.currentTime+0.26);
 }
 </script>
 </body>
